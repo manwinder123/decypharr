@@ -301,6 +301,21 @@ func (s *Service) fetchLink(ctx context.Context, entry *storage.Entry, filename 
 		return s.fetchAndValidate(ctx, entry, filename, attempt+1)
 	}
 
+	// A valid link was fetched — if this entry was previously marked Bad (by a
+	// panic recovery or repeated repair failures), clear the flag so repair and
+	// re-insertion are allowed again. Without this, entries stay permanently
+	// broken (e.g. a whole series' symlinks dead) even after the underlying
+	// debrid links recover.
+	if entry.Bad {
+		entry.Bad = false
+		if s.entrySaver != nil {
+			if err := s.entrySaver(entry); err != nil {
+				s.logger.Warn().Err(err).Str("infohash", entry.InfoHash).Msg("Failed to persist Bad-flag clear after successful link fetch")
+			}
+		}
+		s.logger.Info().Str("infohash", entry.InfoHash).Str("name", entry.Name).Msg("Cleared Bad flag after successful link fetch")
+	}
+
 	return downloadLink, nil
 }
 
