@@ -510,11 +510,14 @@ func (m *Manager) refreshTorrent(infohash string) (*storage.Entry, error) {
 	if err != nil {
 		return nil, err
 	}
+	if entry == nil {
+		// Never return (nil, nil) — callers (e.g. link.GetLink) dereference the
+		// result and a nil entry with no error would panic.
+		return nil, fmt.Errorf("refresh produced no entry for %s", infohash)
+	}
 	// Store updated entry in storage
-	if entry != nil {
-		if err := m.storage.AddOrUpdate(entry); err != nil {
-			return nil, err
-		}
+	if err := m.storage.AddOrUpdate(entry); err != nil {
+		return nil, err
 	}
 	return entry, nil
 }

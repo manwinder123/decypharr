@@ -338,6 +338,13 @@ func (s *Service) getPlacementFile(entry *storage.Entry, filename string) (*stor
 				"refresh_failed",
 			)
 		}
+		if refreshed == nil {
+			// Guard against a nil entry — dereferencing it below would panic.
+			return nil, NewRefetchableError(
+				fmt.Errorf("refresh returned nil entry for %s", entry.InfoHash),
+				"refresh_nil",
+			)
+		}
 
 		file := refreshed.Files[filename]
 		if file == nil {
@@ -384,6 +391,19 @@ func (s *Service) getPlacementFile(entry *storage.Entry, filename string) (*stor
 	return placementFile, nil
 }
 
+// doValidationHead performs the validation HEAD request through the link's
+// provider account client when available — which applies download_rate_limit
+// and retries on transient statuses. Falls back to the shared stream client if
+// no matching account/client can be resolved.
+func (s *Service) doValidationHead(ctx context.Context, link *types.DownloadLink, req *http.Request) (*http.Response, error) {
+	if client, err := s.getClient(link.Debrid); err == nil {
+		if acc, aerr := client.AccountManager().GetAccount(link.Token); aerr == nil && acc != nil && acc.Client() != nil {
+			return acc.Client().Do(req)
+		}
+	}
+	return s.httpClient.Do(req)
+}
+
 // validateLink validates a download link by making a HEAD request
 func (s *Service) validateLink(ctx context.Context, link *types.DownloadLink) error {
 	if link == nil {
@@ -401,7 +421,11 @@ func (s *Service) validateLink(ctx context.Context, link *types.DownloadLink) er
 		)
 	}
 
-	resp, err := s.httpClient.Do(req)
+	// Route the HEAD through the provider account's rate-limited client so link
+	// validation honours download_rate_limit. The previous shared stream client
+	// sent these unthrottled, which flooded provider download endpoints (e.g.
+	// TorBox requestdl) and caused 429 rate-limit storms that broke links.
+	resp, err := s.doValidationHead(ctx, link, req)
 	if err != nil {
 		return NewRetryableError(
 			fmt.Errorf("HEAD request failed: %w", err),

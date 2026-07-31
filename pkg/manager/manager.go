@@ -867,9 +867,9 @@ func (m *Manager) deleteEntryAndRDTorrent(e *storage.Entry, count *int) {
 		placement := e.GetActiveProvider()
 		if placement != nil && placement.ID != "" {
 			if err := client.DeleteTorrent(placement.ID); err != nil {
-				m.logger.Debug().Err(err).Str("name", e.Name).Msg("Failed to delete ghost torrent from RD")
+				m.logger.Debug().Err(err).Str("name", e.Name).Str("debrid", e.ActiveProvider).Msg("Failed to delete ghost torrent from debrid")
 			} else {
-				m.logger.Info().Str("name", e.Name).Str("infohash", e.InfoHash).Msg("Deleted ghost torrent from RD")
+				m.logger.Info().Str("name", e.Name).Str("infohash", e.InfoHash).Str("debrid", e.ActiveProvider).Msg("Deleted ghost torrent from debrid")
 			}
 		}
 	}
