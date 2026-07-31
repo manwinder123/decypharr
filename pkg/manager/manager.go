@@ -268,7 +268,20 @@ func (m *Manager) initLinkService() {
 
 func (m *Manager) initJobQueue() {
 	m.jobQueue = NewJobQueue(m.ctx, m.config.MaxActiveDownloads, m.processJob)
-	m.restoreActiveDownloadJobs()
+	// Restore persisted active/queued downloads in the background. With large
+	// queues this re-parses thousands of NZBs over the network, and running it
+	// inline blocked manager construction — and therefore the HTTP server —
+	// for 60-90 minutes on big libraries, during which every arr reported
+	// "download client unavailable". Backgrounding lets the API serve and the
+	// worker pool drain immediately while the restore catches up.
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				m.logger.Error().Interface("panic", r).Msg("Recovered from panic while restoring active downloads")
+			}
+		}()
+		m.restoreActiveDownloadJobs()
+	}()
 }
 
 func (m *Manager) processJob(ctx context.Context, job *Job) {
@@ -510,7 +523,7 @@ func (m *Manager) Reset() error {
 	return nil
 }
 
-func (m *Manager) GetStats() (map[string]interface{}, error) {
+func (m *Manager) GetStats() (map[string]any, error) {
 	count, err := m.storage.Count()
 	if err != nil {
 		return nil, err
@@ -532,9 +545,9 @@ func (m *Manager) GetStats() (map[string]interface{}, error) {
 		return true
 	})
 
-	return map[string]interface{}{
+	return map[string]any{
 		"total_torrents": count,
-		"storage_stats":  map[string]interface{}{"total_size": diskSize},
+		"storage_stats":  map[string]any{"total_size": diskSize},
 		"active_jobs":    activeJobs,
 		"completed_jobs": completedJobs,
 		"failed_jobs":    failedJobs,

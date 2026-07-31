@@ -261,8 +261,13 @@ func (sr *StreamingReader) readFromCache(ctx context.Context, p []byte, off int6
 		// No intermediate scratch buffer — zero extra allocation, zero amplification.
 		n, ok := sr.cache.ReadRangeInto(segIdx, segDataOffset, copyLen, p[outOffset:outOffset+copyLen])
 		if !ok {
-			// Segment was evicted between WaitForSegment and the read. Re-fetch.
+			// The slot says OnDisk but the bytes aren't readable. Force the
+			// state back to Empty before re-fetching: otherwise Fetch's
+			// OnDisk fast path would short-circuit and we'd loop straight to
+			// the "still missing" error, leaving the segment wedged. This is
+			// the self-heal for any segment that ends up OnDisk-but-empty.
 			sr.logger.Warn().Int("segment", segIdx).Msg("segment data missing after wait, re-fetching")
+			sr.cache.invalidateForRefetch(segIdx)
 			if err := sr.fetcher.Fetch(ctx, segIdx); err != nil {
 				return totalRead, fmt.Errorf("re-fetch segment %d: %w", segIdx, err)
 			}
@@ -284,10 +289,7 @@ func (sr *StreamingReader) readAtEncrypted(ctx context.Context, p []byte, off in
 	alignedStart := (off / crypto.BlockSize) * crypto.BlockSize
 
 	// Determine actual end
-	reqEnd := off + int64(len(p))
-	if reqEnd > sr.totalSize {
-		reqEnd = sr.totalSize
-	}
+	reqEnd := min(off+int64(len(p)), sr.totalSize)
 
 	// Round up to next block
 	alignedEnd := reqEnd
@@ -325,10 +327,7 @@ func (sr *StreamingReader) readAtEncrypted(ctx context.Context, p []byte, off in
 	}
 
 	// Copy requested data to p
-	validDataEnd := int64(n)
-	if validDataEnd > reqEnd-alignedStart {
-		validDataEnd = reqEnd - alignedStart
-	}
+	validDataEnd := min(int64(n), reqEnd-alignedStart)
 
 	startOffset := off - alignedStart
 	if startOffset >= validDataEnd {
