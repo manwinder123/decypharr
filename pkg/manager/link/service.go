@@ -293,8 +293,15 @@ func (s *Service) fetchLink(ctx context.Context, entry *storage.Entry, filename 
 			return emptyDownloadLink, fmt.Errorf("can't repair %s since it's been marked as bad", entry.GetFolder())
 		}
 		if attempt >= MaxReinsertionAttempt {
-			s.markEntryBad(entry, filename, attempt, "empty_link")
-			return emptyDownloadLink, fmt.Errorf("entry %s file %s still resolves to an empty link after %d re-insertion attempts", entry.GetFolder(), filename, attempt)
+			// Do NOT mark the whole entry Bad for a single file's empty link. A
+			// pack can legitimately have a few files RD has no download link for
+			// (e.g. FLAC/aux tracks it never unrestricts); bad-ing the entry here
+			// permanently blocked every other symlink into the pack. Just fail
+			// this one file permanently — the rest of the entry stays servable.
+			return emptyDownloadLink, NewPermanentError(
+				fmt.Errorf("entry %s file %s has no download link after %d attempts", entry.GetFolder(), filename, attempt),
+				"empty_link",
+			)
 		}
 		if s.repairer == nil {
 			// No repairer is configured (Decypharr passes nil and lets the debrid
