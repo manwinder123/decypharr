@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 
 	"github.com/puzpuzpuz/xsync/v4"
@@ -71,17 +72,23 @@ func New(
 func (s *Service) GetLink(ctx context.Context, entry *storage.Entry, filename string) (types.DownloadLink, error) {
 	// Use singleflight to deduplicate concurrent requests for the same file
 	key := entry.InfoHash + ":" + filename
-	v, err, _ := s.singleflight.Do(key, func() (any, error) {
-		// Recover from any panic in fetchAndValidate to prevent crashing Decypharr.
-		// Mark the entry as Bad so it stops being retried endlessly.
+	v, err, _ := s.singleflight.Do(key, func() (_ any, retErr error) {
+		// Recover from any panic in fetchAndValidate so one file's bug can't
+		// crash the mount. IMPORTANT: return an error for the current request
+		// but do NOT mark the whole entry Bad — a single panicking file used to
+		// permanently Bad the entire entry (and thus every symlink into it),
+		// which is what made whole packs unplayable. The fetch is bounded by
+		// singleflight + MaxReinsertionAttempt anyway. The panic stack is logged
+		// so the underlying nil-deref can be root-caused.
 		defer func() {
 			if r := recover(); r != nil {
 				s.logger.Error().
 					Str("infohash", entry.InfoHash).
 					Str("filename", filename).
 					Interface("panic", r).
-					Msg("Recovered panic in GetLink — marking entry as Bad")
-				s.markEntryBad(entry, filename, 0, "panic_recovered")
+					Str("stack", string(debug.Stack())).
+					Msg("Recovered panic in GetLink")
+				retErr = fmt.Errorf("GetLink panic for %s/%s: %v", entry.InfoHash, filename, r)
 			}
 		}()
 		return s.fetchAndValidate(ctx, entry, filename, 0)
@@ -288,6 +295,18 @@ func (s *Service) fetchLink(ctx context.Context, entry *storage.Entry, filename 
 		if attempt >= MaxReinsertionAttempt {
 			s.markEntryBad(entry, filename, attempt, "empty_link")
 			return emptyDownloadLink, fmt.Errorf("entry %s file %s still resolves to an empty link after %d re-insertion attempts", entry.GetFolder(), filename, attempt)
+		}
+		if s.repairer == nil {
+			// No repairer is configured (Decypharr passes nil and lets the debrid
+			// repair engine handle re-insertion). Calling a nil func here panicked
+			// with "invalid memory address" and, via the old panic recovery, marked
+			// the whole entry Bad — nuking every symlink into a pack. Return a
+			// plain error instead; the caller retries are bounded by singleflight
+			// and MaxReinsertionAttempt.
+			return emptyDownloadLink, NewRetryableError(
+				fmt.Errorf("entry %s file %s has an empty link and no repairer is configured", entry.GetFolder(), filename),
+				"empty_link_no_repairer",
+			)
 		}
 		if err := s.repairer(ctx, entry); err != nil {
 			return emptyDownloadLink, err
