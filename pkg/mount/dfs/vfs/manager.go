@@ -65,78 +65,83 @@ func (m *Manager) GetManager() *manager.Manager {
 
 // GetFile returns a streaming file handle
 func (m *Manager) GetFile(info *manager.FileInfo) (*StreamingFile, error) {
-	key := buildFileKey(info.Parent(), info.Name())
-
-	// NewStreamingFile returns nil when the entry's cache item was claimed for
-	// teardown by the cache janitor between handle releases — the fileEntry is
-	// then stale and must be retired so a fresh item can be created. The loop
-	// is bounded: each retry either succeeds or removes the stale entry it
-	// observed, and the janitor's claim/delete pair is near-instantaneous.
-	for range 8 {
-		// Fast path: existing file.
-		// Increment refCount first, then verify the entry wasn't concurrently
-		// deleted by ReleaseFile between our Load and the Add. If it was, undo
-		// the increment and fall through to create a fresh entry.
-		if entry, ok := m.files.Load(key); ok {
-			entry.refCount.Add(1)
-			if !entry.deleted.Load() {
-				if sf := NewStreamingFile(entry.item); sf != nil {
-					return sf, nil
-				}
-			}
-			entry.refCount.Add(-1)
-			m.retireEntry(key, entry)
-		}
-
-		// Get or create cache item
-		item, err := m.cache.GetItem(info.Parent(), info.Name(), info.Size())
-		if err != nil {
-			return nil, fmt.Errorf("failed to get cache item: %w", err)
-		}
-
-		entry := &fileEntry{item: item}
-		entry.refCount.Store(1)
-
-		// Store or return existing
-		actual, loaded := m.files.LoadOrStore(key, entry)
-		if loaded {
-			// Another goroutine created it first
-			actual.refCount.Add(1)
-			if !actual.deleted.Load() {
-				if sf := NewStreamingFile(actual.item); sf != nil {
-					return sf, nil
-				}
-			}
-			actual.refCount.Add(-1)
-			m.retireEntry(key, actual)
-			continue
-		}
-
-		sf := NewStreamingFile(item)
-		if sf == nil {
-			// Our freshly-fetched item was claimed before we could open it
-			// (possible during a forced purge). Retire and retry.
-			m.retireEntry(key, entry)
-			continue
-		}
-		m.totalFiles.Add(1)
-		m.activeFiles.Add(1)
-		return sf, nil
-	}
-	return nil, fmt.Errorf("file %s: cache item kept being torn down; giving up", key)
+	return m.getFile(info.Parent(), info.Name(), info.Size())
 }
 
-// retireEntry marks a stale fileEntry deleted and removes it from the map —
-// but only if it is still the mapped entry, so a fresh replacement stored by
-// a concurrent GetFile is never clobbered.
-func (m *Manager) retireEntry(key string, entry *fileEntry) {
-	entry.deleted.Store(true)
-	m.files.Compute(key, func(old *fileEntry, loaded bool) (*fileEntry, xsync.ComputeOp) {
-		if loaded && old == entry {
-			return nil, xsync.DeleteOp
+// getFile is GetFile's implementation, taking the cache key's raw components
+// instead of *manager.FileInfo so the fast-path/slow-path/eviction logic is
+// testable directly without needing a real manager.Manager to construct a
+// FileInfo (its fields are unexported outside pkg/manager).
+func (m *Manager) getFile(parent, name string, size int64) (*StreamingFile, error) {
+	key := buildFileKey(parent, name)
+
+	// Fast path: existing file.
+	// Increment refCount first, then verify the entry wasn't concurrently deleted
+	// by ReleaseFile between our Load and the Add. If it was, undo the increment
+	// and fall through to the slow path which will create a fresh entry.
+	if entry, ok := m.files.Load(key); ok {
+		entry.refCount.Add(1)
+		if !entry.deleted.Load() {
+			sf, err := NewStreamingFile(entry.item)
+			if err == nil {
+				return sf, nil
+			}
+			// Item was claimed for teardown between our Load and Open. The
+			// underlying CacheItem is being replaced (see Cache.GetItem), but
+			// this fileEntry itself is not: it stays in m.files, still
+			// pointing at the claimed item, until ReleaseFile eventually runs
+			// for whichever handle is still holding it open. If we simply
+			// fell through, the slow path's LoadOrStore below would find this
+			// same stale entry and retry against the same claimed item
+			// forever (EIO for every GetFile on this path until that
+			// unrelated ReleaseFile call happens to land). Evict the stale
+			// entry now — conditioned on it still being the exact entry we
+			// failed against, so we don't clobber one a concurrent slow path
+			// already replaced it with — so the slow path below creates and
+			// stores a genuinely fresh entry instead.
+			m.files.Compute(key, func(oldValue *fileEntry, loaded bool) (*fileEntry, xsync.ComputeOp) {
+				if loaded && oldValue == entry {
+					return nil, xsync.DeleteOp
+				}
+				return oldValue, xsync.CancelOp
+			})
 		}
-		return old, xsync.CancelOp
-	})
+		entry.refCount.Add(-1)
+	}
+
+	// Get or create cache item
+	item, err := m.cache.GetItem(parent, name, size)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get cache item: %w", err)
+	}
+
+	entry := &fileEntry{item: item}
+	entry.refCount.Store(1)
+
+	// Store or return existing
+	actual, loaded := m.files.LoadOrStore(key, entry)
+	if loaded {
+		// Another goroutine created it first
+		actual.refCount.Add(1)
+		sf, err := NewStreamingFile(actual.item)
+		if err != nil {
+			actual.refCount.Add(-1)
+			return nil, fmt.Errorf("failed to open cache item: %w", err)
+		}
+		return sf, nil
+	}
+
+	m.totalFiles.Add(1)
+	m.activeFiles.Add(1)
+	sf, err := NewStreamingFile(item)
+	if err != nil {
+		// item was just created by us via GetItem above and stored in
+		// entry — it cannot already be claimed. Treat as unexpected.
+		m.totalFiles.Add(-1)
+		m.activeFiles.Add(-1)
+		return nil, fmt.Errorf("failed to open cache item: %w", err)
+	}
+	return sf, nil
 }
 
 // ReleaseFile decrements the reference count
@@ -178,8 +183,8 @@ func (m *Manager) Close() error {
 }
 
 // GetStats returns manager statistics
-func (m *Manager) GetStats() map[string]any {
-	stats := map[string]any{
+func (m *Manager) GetStats() map[string]interface{} {
+	stats := map[string]interface{}{
 		"type":         "dfs",
 		"ready":        true,
 		"enabled":      true,
@@ -197,9 +202,9 @@ func (m *Manager) GetStats() map[string]any {
 	return stats
 }
 
-func (m *Manager) CleanupCache() map[string]any {
+func (m *Manager) CleanupCache() map[string]interface{} {
 	if m.cache == nil {
-		return map[string]any{
+		return map[string]interface{}{
 			"cleanup_status": "unsupported",
 			"cleanup_result": "cache is not initialized",
 		}
@@ -207,9 +212,9 @@ func (m *Manager) CleanupCache() map[string]any {
 	return m.cache.RunCleanup()
 }
 
-func (m *Manager) PurgeCache() map[string]any {
+func (m *Manager) PurgeCache() map[string]interface{} {
 	if m.cache == nil {
-		return map[string]any{
+		return map[string]interface{}{
 			"purge_status": "unsupported",
 			"purge_result": "cache is not initialized",
 		}

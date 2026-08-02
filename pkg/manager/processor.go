@@ -430,7 +430,7 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 		if importRequest.DownloadUncached != nil {
 			overrideDownloadUncached = *importRequest.DownloadUncached
 		} else {
-			overrideDownloadUncached = db.Config().DownloadUncached
+			overrideDownloadUncached = db.Config().DownloadsUncached()
 		}
 		debridTorrent.DownloadUncached = overrideDownloadUncached
 		_logger := db.Logger()

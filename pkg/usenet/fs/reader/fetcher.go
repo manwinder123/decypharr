@@ -241,8 +241,19 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 			}
 		}
 
-		// Commit (updates cache state to StateOnDisk).
-		writer.Finalize()
+		// Commit (updates cache state to StateOnDisk). A decoded body that is
+		// entirely consumed by the yEnc dataStart skip (truncated/corrupt
+		// article whose real payload is shorter than the header) commits
+		// nothing even though n > 0 above — treat that the same as the
+		// zero-byte case instead of leaving the segment wedged in
+		// StateFetching forever.
+		if !writer.Finalize() {
+			writer.Discard()
+			return &nntp.Error{
+				Type:    nntp.ErrorTypeArticleNotFound,
+				Message: "article body entirely consumed by header skip, no data committed",
+			}
+		}
 
 		return nil
 	})

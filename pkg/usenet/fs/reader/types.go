@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
@@ -119,6 +120,14 @@ type Config struct {
 
 	// RetryDelay is the delay between retry attempts (default: 1s).
 	RetryDelay time.Duration
+
+	// Logger receives reader/cache/fetcher diagnostics (warnings on re-fetch,
+	// eviction, etc). Defaults to zerolog.Nop() (silent) via DefaultConfig —
+	// the bare zero value of zerolog.Logger is NOT equivalent to Nop() (its
+	// internal writer is an unset nil interface, not io.Discard, and its
+	// level is Debug rather than Disabled), so callers must go through
+	// DefaultConfig/WithLogger rather than constructing a Config directly.
+	Logger zerolog.Logger
 }
 
 // DefaultConfig returns a ReaderConfig with sensible defaults.
@@ -130,6 +139,7 @@ func DefaultConfig() Config {
 		DownloadTimeout: 60 * time.Second,
 		MaxRetries:      3,
 		RetryDelay:      time.Second,
+		Logger:          zerolog.Nop(),
 	}
 }
 
@@ -194,6 +204,14 @@ func WithPrefetchAhead(n int) Option {
 func WithDownloadTimeout(d time.Duration) Option {
 	return func(c *Config) {
 		c.DownloadTimeout = d
+	}
+}
+
+// WithLogger sets the logger used for reader/cache/fetcher diagnostics.
+// Without this option, output is silently dropped (zerolog.Nop()).
+func WithLogger(logger zerolog.Logger) Option {
+	return func(c *Config) {
+		c.Logger = logger
 	}
 }
 

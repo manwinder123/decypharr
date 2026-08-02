@@ -92,7 +92,7 @@ func NewStreamingReader(
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
-	logger := zerolog.Nop() // Use logger from config if available
+	logger := config.Logger // Defaults to zerolog.Nop() via DefaultConfig; set via WithLogger.
 
 	stats := &ReaderStats{}
 
@@ -261,19 +261,10 @@ func (sr *StreamingReader) readFromCache(ctx context.Context, p []byte, off int6
 		// No intermediate scratch buffer — zero extra allocation, zero amplification.
 		n, ok := sr.cache.ReadRangeInto(segIdx, segDataOffset, copyLen, p[outOffset:outOffset+copyLen])
 		if !ok {
-			// The slot says OnDisk but the bytes aren't readable. Force the
-			// state back to Empty before re-fetching: otherwise Fetch's
-			// OnDisk fast path would short-circuit and we'd loop straight to
-			// the "still missing" error, leaving the segment wedged. This is
-			// the self-heal for any segment that ends up OnDisk-but-empty.
-			sr.logger.Warn().Int("segment", segIdx).Msg("segment data missing after wait, re-fetching")
-			sr.cache.invalidateForRefetch(segIdx)
-			if err := sr.fetcher.Fetch(ctx, segIdx); err != nil {
-				return totalRead, fmt.Errorf("re-fetch segment %d: %w", segIdx, err)
-			}
-			n, ok = sr.cache.ReadRangeInto(segIdx, segDataOffset, copyLen, p[outOffset:outOffset+copyLen])
-			if !ok {
-				return totalRead, fmt.Errorf("segment %d still missing after re-fetch", segIdx)
+			var err error
+			n, err = sr.healAndReadSegment(ctx, segIdx, segDataOffset, copyLen, p[outOffset:outOffset+copyLen])
+			if err != nil {
+				return totalRead, err
 			}
 		}
 
@@ -283,13 +274,65 @@ func (sr *StreamingReader) readFromCache(ctx context.Context, p []byte, off int6
 	return totalRead, nil
 }
 
+// maxSegmentHealAttempts bounds healAndReadSegment's retry loop. Each
+// iteration performs one Fetch call (which itself waits out any in-progress
+// eviction or in-flight fetch before returning), so this is not a busy loop;
+// the cap exists only to fail with a clear error instead of looping forever
+// if the cache is stuck in an unexpected state-transition pattern.
+const maxSegmentHealAttempts = 20
+
+// healAndReadSegment is the self-heal path for a segment whose slot says
+// OnDisk but whose bytes are unreadable (ReadRangeInto returned !ok).
+//
+// Multiple concurrent readers (the SegmentCache is shared across every
+// ReadAt on this file) can observe the same stale !ok at once. Only the
+// reader that wins invalidateForRefetch's CAS (StateOnDisk -> StateEmpty)
+// forces the stale slot to re-download; a loser's CAS fails harmlessly
+// because the state has already moved on — to StateEmpty (winner got there
+// first), StateEvicting (a concurrent evictor claimed it instead), or
+// already back to StateOnDisk (winner's fetch already landed).
+//
+// A loser must not itself call invalidateForRefetch again once the winner's
+// fetch completes: that would discard freshly-fetched good data and
+// re-fetch for nothing. But it also cannot just call WaitForSegment once and
+// assume success: WaitForSegment only returns on StateOnDisk/StateFailed,
+// so if it wakes into StateEmpty (e.g. an evictor's OnDisk->Evicting->Empty
+// transition ran instead of a fetch) nothing will ever move the segment
+// forward and the loser would block until the caller's context deadline —
+// exactly the wedge this whole mechanism exists to close.
+//
+// Fetch itself already waits out StateEvicting and no-ops on StateOnDisk, and
+// its own in-flight map dedups concurrent StateFetching callers for free, so
+// calling Fetch again after the initial CAS is both correct and sufficient
+// for every state the segment could be in — the retry loop just needs to
+// re-check the actual bytes after each Fetch, since Fetch reports success
+// for "someone's fetch completed," not specifically "the segment we care
+// about is now readable."
+func (sr *StreamingReader) healAndReadSegment(ctx context.Context, segIdx int, segDataOffset, copyLen int64, dst []byte) (int, error) {
+	if sr.cache.invalidateForRefetch(segIdx) {
+		sr.logger.Warn().Int("segment", segIdx).Msg("segment data missing after wait, re-fetching")
+	}
+	for attempt := 0; attempt < maxSegmentHealAttempts; attempt++ {
+		if err := sr.fetcher.Fetch(ctx, segIdx); err != nil {
+			return 0, fmt.Errorf("re-fetch segment %d: %w", segIdx, err)
+		}
+		if n, ok := sr.cache.ReadRangeInto(segIdx, segDataOffset, copyLen, dst); ok {
+			return n, nil
+		}
+	}
+	return 0, fmt.Errorf("segment %d still missing after %d heal attempts", segIdx, maxSegmentHealAttempts)
+}
+
 // readAtEncrypted handles AES-CBC encrypted reads.
 func (sr *StreamingReader) readAtEncrypted(ctx context.Context, p []byte, off int64) (int, error) {
 	// AES-CBC requires block-aligned reads
 	alignedStart := (off / crypto.BlockSize) * crypto.BlockSize
 
 	// Determine actual end
-	reqEnd := min(off+int64(len(p)), sr.totalSize)
+	reqEnd := off + int64(len(p))
+	if reqEnd > sr.totalSize {
+		reqEnd = sr.totalSize
+	}
 
 	// Round up to next block
 	alignedEnd := reqEnd
@@ -327,7 +370,10 @@ func (sr *StreamingReader) readAtEncrypted(ctx context.Context, p []byte, off in
 	}
 
 	// Copy requested data to p
-	validDataEnd := min(int64(n), reqEnd-alignedStart)
+	validDataEnd := int64(n)
+	if validDataEnd > reqEnd-alignedStart {
+		validDataEnd = reqEnd - alignedStart
+	}
 
 	startOffset := off - alignedStart
 	if startOffset >= validDataEnd {

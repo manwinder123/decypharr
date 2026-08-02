@@ -204,7 +204,7 @@ func NewSegmentCache(
 		stats:       stats,
 	}
 
-	for i := range numShards {
+	for i := 0; i < numShards; i++ {
 		sc.shardCond[i] = sync.NewCond(&sc.shardMu[i])
 	}
 
@@ -384,10 +384,15 @@ func (sc *SegmentCache) Put(segIdx int, data []byte) error {
 }
 
 // segmentWriter is the contract doFetch uses to stream a segment body into
-// the cache. Exactly one of Finalize/Discard is called per writer.
+// the cache. Exactly one of Finalize/Discard is called per writer. Finalize
+// reports whether it actually committed bytes to the cache — a decoded body
+// that is entirely consumed by the yEnc dataStart skip (e.g. a truncated or
+// corrupt article whose real payload is shorter than expected) commits
+// nothing, and the caller must treat that as a failed fetch rather than
+// leaving the segment silently stuck in StateFetching forever.
 type segmentWriter interface {
 	Write(p []byte) (int, error)
-	Finalize()
+	Finalize() bool
 	Discard()
 }
 
@@ -449,7 +454,10 @@ func (w *bufferStreamWriter) Write(p []byte) (int, error) {
 	}
 
 	remaining := w.maxBytes - w.written
-	writeLen := min(int64(len(p)), remaining)
+	writeLen := int64(len(p))
+	if writeLen > remaining {
+		writeLen = remaining
+	}
 
 	n, err := w.buf.WriteAt(p[:writeLen], w.offset+w.written)
 	if err != nil {
@@ -466,9 +474,9 @@ func (w *bufferStreamWriter) Discard() {}
 
 // Finalize commits the segment to the cache: state to OnDisk, length
 // recorded, waiters woken.
-func (w *bufferStreamWriter) Finalize() {
+func (w *bufferStreamWriter) Finalize() bool {
 	if w.cache == nil || w.segIdx < 0 || w.written <= 0 {
-		return
+		return false
 	}
 	w.cache.curDisk.Add(w.written)
 	w.cache.segLengths[w.segIdx].Store(w.written)
@@ -476,6 +484,7 @@ func (w *bufferStreamWriter) Finalize() {
 	w.cache.touchSegment(w.segIdx)
 	w.cache.wakeWaiters(w.segIdx)
 	w.cache.signalEvict()
+	return true
 }
 
 // PinRange marks segments as in-use, preventing eviction.
@@ -666,10 +675,20 @@ func (sc *SegmentCache) WaitForEvictionRelease(ctx context.Context, segIdx int) 
 		cond.Broadcast()
 		mu.Unlock()
 	}
-	ctxStopper := context.AfterFunc(ctx, wakeShard)
+	var stopWatchers []func()
+	if ctx != nil {
+		stopper := context.AfterFunc(ctx, wakeShard)
+		stopWatchers = append(stopWatchers, func() { stopper() })
+	}
 	cacheStopper := context.AfterFunc(sc.ctx, wakeShard)
-	defer ctxStopper()
-	defer cacheStopper()
+	stopWatchers = append(stopWatchers, func() { cacheStopper() })
+	defer func() {
+		for _, stop := range stopWatchers {
+			if stop != nil {
+				stop()
+			}
+		}
+	}()
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -693,16 +712,27 @@ func (sc *SegmentCache) WaitForEvictionRelease(ctx context.Context, segIdx int) 
 // guarantees the disk accounting is rolled back exactly once even if two readers
 // hit the same wedged segment concurrently. Safe to call on a pinned segment —
 // the subsequent re-fetch overwrites the slot in place.
-func (sc *SegmentCache) invalidateForRefetch(segIdx int) {
+//
+// Returns whether this call actually performed the transition. The caller
+// must check this: multiple readers can independently observe the same stale
+// !ok from ReadRangeInto and race to invalidate. Only the CAS winner should
+// trigger a re-fetch — if the segment has already moved past OnDisk by the
+// time this is called (another reader's invalidate+refetch already ran and
+// the segment is legitimately OnDisk again with fresh data, or a fetch is
+// already in flight), the CAS fails and the caller must not treat that as
+// "I own the recovery," or it would discard a freshly-fetched good segment.
+func (sc *SegmentCache) invalidateForRefetch(segIdx int) bool {
 	if segIdx < 0 || segIdx >= sc.segCount {
-		return
+		return false
 	}
-	if sc.states[segIdx].CompareAndSwap(uint32(StateOnDisk), uint32(StateEmpty)) {
+	won := sc.states[segIdx].CompareAndSwap(uint32(StateOnDisk), uint32(StateEmpty))
+	if won {
 		if size := sc.segLengths[segIdx].Load(); size > 0 {
 			sc.curDisk.Add(-size)
 		}
+		sc.errors[segIdx].Store(nil)
 	}
-	sc.errors[segIdx].Store(nil)
+	return won
 }
 
 // wakeWaiters wakes any WaitForSegment callers parked on this segment's shard.
@@ -742,16 +772,17 @@ func (sc *SegmentCache) evictLoop() {
 }
 
 // drainOverBudget is the hard-disk backstop.
+//
+// StreamWriter, Put, and the background evictor can all notice the same
+// overshoot concurrently. Let one caller do the scan and punching while
+// the others wait; once they acquire the lock the budget is normally
+// already satisfied. Without this guard, N concurrent segment completions
+// can each scan the full segment table and race to evict the same batch.
 func (sc *SegmentCache) drainOverBudget() {
 	if sc.maxDisk <= 0 {
 		return
 	}
 
-	// StreamWriter, Put, and the background evictor can all notice the same
-	// overshoot concurrently. Let one caller do the scan and punching while
-	// the others wait; once they acquire the lock the budget is normally
-	// already satisfied. Without this guard, N concurrent segment completions
-	// can each scan the full segment table and race to evict the same batch.
 	sc.evictMu.Lock()
 	defer sc.evictMu.Unlock()
 
@@ -1068,7 +1099,7 @@ func (sc *SegmentCache) Close() error {
 	}
 	sc.cancel()
 
-	for i := range numShards {
+	for i := 0; i < numShards; i++ {
 		sc.shardMu[i].Lock()
 		sc.shardCond[i].Broadcast()
 		sc.shardMu[i].Unlock()

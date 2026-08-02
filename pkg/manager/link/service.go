@@ -72,14 +72,9 @@ func New(
 func (s *Service) GetLink(ctx context.Context, entry *storage.Entry, filename string) (types.DownloadLink, error) {
 	// Use singleflight to deduplicate concurrent requests for the same file
 	key := entry.InfoHash + ":" + filename
-	v, err, _ := s.singleflight.Do(key, func() (_ any, retErr error) {
-		// Recover from any panic in fetchAndValidate so one file's bug can't
-		// crash the mount. IMPORTANT: return an error for the current request
-		// but do NOT mark the whole entry Bad — a single panicking file used to
-		// permanently Bad the entire entry (and thus every symlink into it),
-		// which is what made whole packs unplayable. The fetch is bounded by
-		// singleflight + MaxReinsertionAttempt anyway. The panic stack is logged
-		// so the underlying nil-deref can be root-caused.
+	v, err, _ := s.singleflight.Do(key, func() (any, error) {
+		// Recover from any panic in fetchAndValidate to prevent crashing Decypharr.
+		// Mark the entry as Bad so it stops being retried endlessly.
 		defer func() {
 			if r := recover(); r != nil {
 				s.logger.Error().
@@ -87,8 +82,8 @@ func (s *Service) GetLink(ctx context.Context, entry *storage.Entry, filename st
 					Str("filename", filename).
 					Interface("panic", r).
 					Str("stack", string(debug.Stack())).
-					Msg("Recovered panic in GetLink")
-				retErr = fmt.Errorf("GetLink panic for %s/%s: %v", entry.InfoHash, filename, r)
+					Msg("Recovered panic in GetLink — marking entry as Bad")
+				s.markEntryBad(entry, filename, 0, "panic_recovered")
 			}
 		}()
 		return s.fetchAndValidate(ctx, entry, filename, 0)
@@ -292,28 +287,17 @@ func (s *Service) fetchLink(ctx context.Context, entry *storage.Entry, filename 
 		if entry.Bad {
 			return emptyDownloadLink, fmt.Errorf("can't repair %s since it's been marked as bad", entry.GetFolder())
 		}
-		if attempt >= MaxReinsertionAttempt {
-			// Do NOT mark the whole entry Bad for a single file's empty link. A
-			// pack can legitimately have a few files RD has no download link for
-			// (e.g. FLAC/aux tracks it never unrestricts); bad-ing the entry here
-			// permanently blocked every other symlink into the pack. Just fail
-			// this one file permanently — the rest of the entry stays servable.
-			return emptyDownloadLink, NewPermanentError(
-				fmt.Errorf("entry %s file %s has no download link after %d attempts", entry.GetFolder(), filename, attempt),
-				"empty_link",
-			)
-		}
 		if s.repairer == nil {
-			// No repairer is configured (Decypharr passes nil and lets the debrid
-			// repair engine handle re-insertion). Calling a nil func here panicked
-			// with "invalid memory address" and, via the old panic recovery, marked
-			// the whole entry Bad — nuking every symlink into a pack. Return a
-			// plain error instead; the caller retries are bounded by singleflight
-			// and MaxReinsertionAttempt.
-			return emptyDownloadLink, NewRetryableError(
-				fmt.Errorf("entry %s file %s has an empty link and no repairer is configured", entry.GetFolder(), filename),
-				"empty_link_no_repairer",
-			)
+			// No repairer configured (e.g. this fork's CLI-managed re-insertion) —
+			// mark bad immediately so CLI can handle it, same as handleBadLink's
+			// no-repairer path. Without this check, calling a nil s.repairer
+			// panics (nil func value).
+			s.markEntryBad(entry, filename, attempt, "empty_link")
+			return emptyDownloadLink, fmt.Errorf("entry %s is broken (no repairer configured)", entry.GetFolder())
+		}
+		if attempt >= MaxReinsertionAttempt {
+			s.markEntryBad(entry, filename, attempt, "empty_link")
+			return emptyDownloadLink, fmt.Errorf("entry %s file %s still resolves to an empty link after %d re-insertion attempts", entry.GetFolder(), filename, attempt)
 		}
 		if err := s.repairer(ctx, entry); err != nil {
 			return emptyDownloadLink, err
@@ -325,21 +309,6 @@ func (s *Service) fetchLink(ctx context.Context, entry *storage.Entry, filename 
 		}
 		// Bypass singleflight re-entry to avoid deadlock
 		return s.fetchAndValidate(ctx, entry, filename, attempt+1)
-	}
-
-	// A valid link was fetched — if this entry was previously marked Bad (by a
-	// panic recovery or repeated repair failures), clear the flag so repair and
-	// re-insertion are allowed again. Without this, entries stay permanently
-	// broken (e.g. a whole series' symlinks dead) even after the underlying
-	// debrid links recover.
-	if entry.Bad {
-		entry.Bad = false
-		if s.entrySaver != nil {
-			if err := s.entrySaver(entry); err != nil {
-				s.logger.Warn().Err(err).Str("infohash", entry.InfoHash).Msg("Failed to persist Bad-flag clear after successful link fetch")
-			}
-		}
-		s.logger.Info().Str("infohash", entry.InfoHash).Str("name", entry.Name).Msg("Cleared Bad flag after successful link fetch")
 	}
 
 	return downloadLink, nil
@@ -380,11 +349,15 @@ func (s *Service) getPlacementFile(entry *storage.Entry, filename string) (*stor
 			)
 		}
 		if refreshed == nil {
-			// Guard against a nil entry — dereferencing it below would panic.
-			return nil, NewRefetchableError(
-				fmt.Errorf("refresh returned nil entry for %s", entry.InfoHash),
-				"refresh_nil",
-			)
+			// EntryRefresher (Manager.refreshTorrent) legitimately returns
+			// (nil, nil) when the provider's file list is still incomplete
+			// (e.g. a season pack where the debrid API dropped some links —
+			// isComplete fails, processSyncTorrent returns nil, nil) — this
+			// is not an error, just "not ready yet". Treat it the same as a
+			// missing file below: hoster unavailable, so handleBadLink can
+			// mark it bad / trigger re-insertion instead of a nil dereference
+			// on refreshed.Files.
+			return nil, customerror.HosterUnavailableError
 		}
 
 		file := refreshed.Files[filename]
@@ -432,19 +405,6 @@ func (s *Service) getPlacementFile(entry *storage.Entry, filename string) (*stor
 	return placementFile, nil
 }
 
-// doValidationHead performs the validation HEAD request through the link's
-// provider account client when available — which applies download_rate_limit
-// and retries on transient statuses. Falls back to the shared stream client if
-// no matching account/client can be resolved.
-func (s *Service) doValidationHead(ctx context.Context, link *types.DownloadLink, req *http.Request) (*http.Response, error) {
-	if client, err := s.getClient(link.Debrid); err == nil {
-		if acc, aerr := client.AccountManager().GetAccount(link.Token); aerr == nil && acc != nil && acc.Client() != nil {
-			return acc.Client().Do(req)
-		}
-	}
-	return s.httpClient.Do(req)
-}
-
 // validateLink validates a download link by making a HEAD request
 func (s *Service) validateLink(ctx context.Context, link *types.DownloadLink) error {
 	if link == nil {
@@ -462,11 +422,7 @@ func (s *Service) validateLink(ctx context.Context, link *types.DownloadLink) er
 		)
 	}
 
-	// Route the HEAD through the provider account's rate-limited client so link
-	// validation honours download_rate_limit. The previous shared stream client
-	// sent these unthrottled, which flooded provider download endpoints (e.g.
-	// TorBox requestdl) and caused 429 rate-limit storms that broke links.
-	resp, err := s.doValidationHead(ctx, link, req)
+	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return NewRetryableError(
 			fmt.Errorf("HEAD request failed: %w", err),
