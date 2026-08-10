@@ -49,6 +49,13 @@ func (a *Account) sliceFileLink(fileLink string) string {
 func (a *Account) GetDownloadLink(id string, file *types.File, fetcher LinkFetcher) (types.DownloadLink, error) {
 	slicedLink := a.sliceFileLink(file.Link)
 	dl, ok := a.links.Load(slicedLink)
+	// Treat an expired cached link as a cache miss so a stale CDN URL is
+	// refreshed via a fresh requestdl call. This keeps the cached CDN URLs (see
+	// torbox fetchDownloadLink) valid and avoids reusing one TorBox has revoked.
+	if ok && !dl.ExpiresAt.IsZero() && time.Now().After(dl.ExpiresAt) {
+		a.links.Delete(slicedLink)
+		ok = false
+	}
 	if !ok {
 		var err error
 		dl, err = fetcher(a, id, file)

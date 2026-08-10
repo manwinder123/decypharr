@@ -966,6 +966,16 @@ func (s *Server) handleClearBroken(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, run, http.StatusOK)
 }
 
+// handleClearBad clears decypharr's Bad flag for every entry whose infohash is
+// present and downloadable on its debrid provider. Used by the periodic un-Bad
+// sweep so servable entries don't pile up in __bad__ and block reads. The
+// sweep can take a while (provider list fetch), so it runs in the background
+// and the endpoint returns immediately.
+func (s *Server) handleClearBad(w http.ResponseWriter, r *http.Request) {
+	go s.manager.ClearHealthyBadFlags()
+	utils.JSONResponse(w, map[string]string{"status": "started"}, http.StatusOK)
+}
+
 func (s *Server) handleClearRepairState(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Statuses []string `json:"statuses"`

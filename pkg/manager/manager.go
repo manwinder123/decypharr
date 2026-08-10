@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +41,18 @@ type Manager struct {
 	ready        chan struct{}
 	readyOnce    sync.Once
 	streamClient *http.Client
+
+	// Per-provider CDN stream pools. Each debrid account enforces its own
+	// concurrent-download slot ceiling (TorBox "essential" = 3; Real-Debrid =
+	// its /torrents/activeCount limit, typically 100 for premium). Streams for
+	// a provider acquire a token from that provider's pool, so parallel
+	// transcodes/prefetches/Plex reads can use each provider up to its real
+	// ceiling (e.g. 3 TorBox + N Real-Debrid) without 429ing either one.
+	// defaultStreamLimit is the fallback when a provider doesn't report slots;
+	// override via DECYPHARR_MAX_CONCURRENT_STREAMS.
+	defaultStreamLimit int
+	streamSemMu        sync.Mutex
+	streamSems         map[string]chan struct{}
 
 	// Migration jobs tracking
 	migrationJobs   *xsync.Map[string, *storage.SwitcherJob]
@@ -85,6 +98,13 @@ type Manager struct {
 	// Unified active-download queue for torrent and NZB imports.
 	jobQueue  *JobQueue
 	nzbSyncMu sync.Mutex
+
+	// badClearMu serializes the healthy-un-Bad sweep (startup + periodic) and
+	// healthyHashes caches provider presence so periodic sweeps don't re-fetch
+	// every provider's full torrent list on each call.
+	badClearMu         sync.Mutex
+	healthyHashes      map[string]bool
+	healthyHashesAfter time.Time
 
 	// Notifications service
 	Notifications *notifications.Service
@@ -140,6 +160,16 @@ func New() *Manager {
 		usenetTimeout = 10 * time.Minute
 	}
 
+	// Fallback concurrent-stream limit per provider when the provider doesn't
+	// report a slot ceiling (TorBox "essential" reports 3; Real-Debrid reports
+	// ~100). Sized pools are created lazily per provider from GetAvailableSlots.
+	defaultStreamLimit := 3
+	if v := os.Getenv("DECYPHARR_MAX_CONCURRENT_STREAMS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			defaultStreamLimit = n
+		}
+	}
+
 	instance := &Manager{
 		storage:                strg,
 		clients:                xsync.NewMap[string, debrid.Client](),
@@ -151,6 +181,8 @@ func New() *Manager {
 		ctx:                    ctx,
 		ready:                  make(chan struct{}),
 		streamClient:           streamClient,
+		defaultStreamLimit:     defaultStreamLimit,
+		streamSems:             make(map[string]chan struct{}),
 		usenetTimeout:          usenetTimeout,
 		debridSpeedTestResults: xsync.NewMap[string, debridTypes.SpeedTestResult](),
 		activeStreams:          xsync.NewMap[string, *ActiveStream](),
@@ -658,43 +690,63 @@ func (m *Manager) ClearBadFlag(infohash string) {
 // clearBadFlagsForHealthyTorrents clears Bad=false only for entries whose
 // infohash is present on the debrid provider as a downloaded torrent.
 // Called on startup so re-inserted torrents recover automatically after restart.
-func (m *Manager) clearBadFlagsForHealthyTorrents() {
-	// Build set of downloaded infohashes from all providers
-	healthyHashes := make(map[string]bool)
-	m.clients.Range(func(_ string, client debrid.Client) bool {
-		torrents, err := client.GetTorrents()
-		if err != nil {
-			return true
-		}
-		for _, t := range torrents {
-			if t.InfoHash != "" {
-				healthyHashes[t.InfoHash] = true
+// The provider hash list is cached (refreshed every 6h) so periodic sweeps are
+// cheap and don't re-fetch every provider's torrent list each call. Returns the
+// number of entries un-badged.
+func (m *Manager) clearBadFlagsForHealthyTorrents() int {
+	m.badClearMu.Lock()
+	defer m.badClearMu.Unlock()
+
+	// Refresh the provider hash set only when stale.
+	if m.healthyHashes == nil || time.Since(m.healthyHashesAfter) > 6*time.Hour {
+		hashes := make(map[string]bool)
+		m.clients.Range(func(_ string, client debrid.Client) bool {
+			torrents, err := client.GetTorrents()
+			if err != nil {
+				return true
 			}
-		}
-		return true
-	})
-	if len(healthyHashes) == 0 {
-		return
+			for _, t := range torrents {
+				if t.InfoHash != "" {
+					hashes[t.InfoHash] = true
+				}
+			}
+			return true
+		})
+		m.healthyHashes = hashes
+		m.healthyHashesAfter = time.Now()
+		m.logger.Debug().Int("hashes", len(m.healthyHashes)).Msg("Refreshed healthy-hash cache for un-Bad sweep")
+	}
+	if len(m.healthyHashes) == 0 {
+		return 0
 	}
 	cleared := 0
 	_ = m.storage.ForEach(func(entry *storage.Entry) error {
 		if !entry.Bad {
 			return nil
 		}
-		if !healthyHashes[entry.InfoHash] {
+		if !m.healthyHashes[entry.InfoHash] {
 			return nil // Not on RD as downloaded — leave Bad=true
 		}
 		entry.Bad = false
 		if err := m.storage.AddOrUpdate(entry); err != nil {
 			return nil
 		}
-		m.logger.Info().Str("infohash", entry.InfoHash).Str("name", entry.Name).Msg("Cleared Bad flag on startup (torrent healthy on RD)")
+		m.logger.Info().Str("infohash", entry.InfoHash).Str("name", entry.Name).Msg("Cleared Bad flag (torrent healthy on debrid)")
 		cleared++
 		return nil
 	})
 	if cleared > 0 {
-		m.logger.Info().Int("cleared", cleared).Msg("Cleared Bad flags for healthy torrents on startup")
+		m.logger.Info().Int("cleared", cleared).Msg("Cleared Bad flags for healthy torrents")
 	}
+	return cleared
+}
+
+// ClearHealthyBadFlags is the exported, callable form of
+// clearBadFlagsForHealthyTorrents — used by the periodic un-Bad sweep so
+// servable entries don't accumulate in __bad__ over time. Returns how many
+// entries were un-badged.
+func (m *Manager) ClearHealthyBadFlags() int {
+	return m.clearBadFlagsForHealthyTorrents()
 }
 
 // deleteGhostEntries removes ghost torrent entries — raw-RD-named duplicates of

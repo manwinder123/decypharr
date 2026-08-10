@@ -36,6 +36,12 @@ var planSlots = map[string]int{
 	"pro":       10,
 }
 
+// torboxCDNLinkTTL bounds how long a requestdl-minted CDN URL is reused before
+// being re-fetched. TorBox's presigned CDN links expire well before the config
+// auto_expire_links_after default (1d); re-minting every ~10 min keeps streams
+// on live URLs without hitting the per-minute requestdl throttle.
+const torboxCDNLinkTTL = 10 * time.Minute
+
 type Torbox struct {
 	Host                  string `json:"host"`
 	APIKey                string
@@ -531,23 +537,77 @@ func (tb *Torbox) fetchDownloadLink(account *account.Account, id string, file *t
 	query.Set("token", account.Token)
 	query.Set("torrent_id", id)
 	query.Set("file_id", file.Id)
-	query.Set("redirect", "true")
+	// IMPORTANT: redirect=false. requestdl then returns JSON containing the real
+	// CDN URL, which we cache and reuse across stream chunks. Following the 307
+	// redirect per chunk is what hammered TorBox's /requestdl (throttled ~20/min
+	// in practice) — a 2-hour file with 4MB chunks issued ~375 API calls.
+	query.Set("redirect", "false")
 
-	downloadURL := fmt.Sprintf("%s/api/torrents/requestdl?%s", tb.Host, query.Encode())
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/api/torrents/requestdl?%s", tb.Host, query.Encode()), nil)
+	if err != nil {
+		return types.DownloadLink{}, err
+	}
+
+	// tb.client applies the per-debrid rate limiter and retries retryable
+	// statuses (429/502) with backoff, so a single requestdl call is safe.
+	resp, err := tb.client.Do(req)
+	if err != nil {
+		return types.DownloadLink{}, fmt.Errorf("requestdl: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return types.DownloadLink{}, fmt.Errorf(
+			"torbox requestdl failed (status %d): %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+
+	var out RequestDLResponse
+	if err := json.ConfigDefault.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return types.DownloadLink{}, fmt.Errorf("torbox requestdl decode: %w", err)
+	}
+	if !out.Success || out.Data == nil {
+		return types.DownloadLink{}, fmt.Errorf("torbox requestdl returned no CDN link")
+	}
+
+	// Extract the CDN URL. Current API: data is a plain string. Older revisions
+	// returned an object with a download_link field. Accept both so a single
+	// malformed/unexpected shape can never wedge the whole provider again.
+	var cdnURL string
+	if err := json.Unmarshal(*out.Data, &cdnURL); err == nil && cdnURL != "" {
+		// string form — nothing to do
+	} else {
+		var obj struct {
+			DownloadLink string `json:"download_link"`
+		}
+		if err := json.Unmarshal(*out.Data, &obj); err != nil || obj.DownloadLink == "" {
+			return types.DownloadLink{}, fmt.Errorf("torbox requestdl returned no CDN link")
+		}
+		cdnURL = obj.DownloadLink
+	}
 
 	now := time.Now()
 
-	// Always expires
+	// TorBox CDN URLs are short-lived presigned links. Cap the cache TTL well
+	// below auto_expire_links_after (default 1d) so a revoked CDN URL is
+	// re-minted by requestdl long before a long transcode tries to reuse it.
+	expiry := tb.autoExpiresLinksAfter
+	if expiry <= 0 || expiry > torboxCDNLinkTTL {
+		expiry = torboxCDNLinkTTL
+	}
+
+	// Cache the real CDN URL (keyed by file.Link in the account manager) so each
+	// stream chunk hits the CDN directly instead of the TorBox API.
 	dl := types.DownloadLink{
 		Filename:     file.Name,
 		Size:         file.Size,
 		Token:        tb.APIKey,
 		Link:         file.Link,
-		DownloadLink: downloadURL,
+		DownloadLink: cdnURL,
 		Debrid:       tb.config.Name,
 		Id:           file.Id,
 		Generated:    now,
-		ExpiresAt:    now.Add(tb.autoExpiresLinksAfter),
+		ExpiresAt:    now.Add(expiry),
 	}
 	return dl, nil
 }

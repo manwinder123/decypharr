@@ -25,6 +25,13 @@ type Debrid struct {
 	AutoExpireLinksAfter         string   `json:"auto_expire_links_after,omitempty"`
 	UserAgent                    string   `json:"user_agent,omitempty"`
 
+	// MaxConcurrentStreams overrides the concurrent CDN-stream pool size for
+	// this provider (the per-stream semaphore pool in streamPoolFor). 0/absent =
+	// use the provider-reported available slots (TorBox "essential" = 3,
+	// Real-Debrid = ~100). Raise it to allow more parallel downloads than the
+	// plan reports — read live, so a UI/config change applies without a restart.
+	MaxConcurrentStreams int `json:"max_concurrent_streams,omitempty"`
+
 	// Folder
 	Folder        string `json:"folder,omitempty"`          // Deprecated. Use Mount MountPath instead.
 	FolderNaming  string `json:"folder_naming,omitempty"`   // Deprecated. Use global setting instead.

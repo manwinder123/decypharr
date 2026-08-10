@@ -208,6 +208,59 @@ func (m *Manager) UntrackStream(streamID string) {
 	m.unregisterStream(streamID)
 }
 
+// streamPoolFor returns the CDN concurrency pool for a debrid provider,
+// creating it lazily sized to that provider's effective ceiling. The effective
+// ceiling is resolved from the per-provider config override
+// (Debrid.MaxConcurrentStreams, read live every call so UI/config changes apply
+// without a restart), falling back to the provider's reported available slots
+// (TorBox "essential" = 3; Real-Debrid = its /torrents/activeCount limit), and
+// finally to defaultStreamLimit. When the effective size changes the pool is
+// transparently swapped for a correctly-sized channel.
+func (m *Manager) streamPoolFor(provider string) chan struct{} {
+	m.streamSemMu.Lock()
+	defer m.streamSemMu.Unlock()
+	size := m.effectiveStreamLimit(provider)
+	if s, ok := m.streamSems[provider]; ok {
+		if cap(s) != size {
+			next := make(chan struct{}, size)
+			m.streamSems[provider] = next
+			m.logger.Info().Str("debrid", provider).Int("slots", size).Msg("CDN stream pool resized")
+			return next
+		}
+		return s
+	}
+	s := make(chan struct{}, size)
+	m.streamSems[provider] = s
+	m.logger.Info().Str("debrid", provider).Int("slots", size).Msg("CDN stream pool initialized")
+	return s
+}
+
+// effectiveStreamLimit resolves the CDN concurrency ceiling for a provider:
+// per-debrid config override (MaxConcurrentStreams > 0) wins over the
+// provider-reported slot count, which wins over the default fallback.
+func (m *Manager) effectiveStreamLimit(provider string) int {
+	if cfg := m.config; cfg != nil {
+		for _, d := range cfg.Debrids {
+			if !strings.EqualFold(d.Provider, provider) && !strings.EqualFold(d.Name, provider) {
+				continue
+			}
+			if d.MaxConcurrentStreams > 0 {
+				return d.MaxConcurrentStreams
+			}
+			break
+		}
+	}
+	if client := m.ProviderClient(provider); client != nil {
+		if slots, err := client.GetAvailableSlots(); err == nil && slots > 0 {
+			return slots
+		}
+	}
+	if m.defaultStreamLimit < 1 {
+		return 1
+	}
+	return m.defaultStreamLimit
+}
+
 // streamHTTP handles streaming for torrent files via HTTP
 func (m *Manager) streamHTTP(ctx context.Context, torrent *storage.Entry, filename string, start, end int64, writer io.Writer, onReady StreamReadyFunc) error {
 	file, ok := torrent.Files[filename]
@@ -227,6 +280,20 @@ func (m *Manager) streamHTTP(ctx context.Context, torrent *storage.Entry, filena
 	bufPtr := streamBufPool.Get().(*[]byte)
 	buf := *bufPtr
 	defer streamBufPool.Put(bufPtr)
+
+	// Acquire a slot in this provider's CDN-stream pool (sized to the debrid
+	// account's concurrent-download ceiling, e.g. TorBox essential=3, RD ~100).
+	// Reads for different providers use independent pools, so parallel
+	// transcodes/prefetches/Plex reads can use 3 TorBox + N Real-Debrid
+	// concurrently without 429ing either. Held for the whole chunk so downloads
+	// interleave fairly.
+	sem := m.streamPoolFor(torrent.ActiveProvider)
+	select {
+	case sem <- struct{}{}:
+		defer func() { <-sem }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 
 	resp, reqErr := m.doRequest(ctx, downloadLink.DownloadLink, start, end)
 	if reqErr != nil {
@@ -280,14 +347,24 @@ func (m *Manager) streamHTTP(ctx context.Context, torrent *storage.Entry, filena
 		}
 
 		if copyErr != nil && copyErr != io.EOF {
+			// Context cancelled by the no-progress watchdog (stream stalled) or a
+			// session teardown. Invalidate the link so the retry path in
+			// downloaders.go mints a fresh CDN URL instead of reusing the dead one
+			// and stalling for 45s again. Returned retriable so the existing retry
+			// loop backs off and re-attempts.
+			if ctx.Err() != nil {
+				m.linkService.Invalidate(downloadLink)
+				if isConnectionError(copyErr) || strings.Contains(copyErr.Error(), "timeout") {
+					return copyErr
+				}
+				return StreamError{Err: copyErr, Retryable: true}
+			}
 			// Check if this is a retriable error (timeout, network issue)
 			// vs a permanent error (context cancelled by user)
-			if ctx.Err() != nil {
-				// User/system cancelled - don't retry
-				return retry.Unrecoverable(ctx.Err())
-			}
 			if isConnectionError(copyErr) || strings.Contains(copyErr.Error(), "timeout") {
-				// Network/timeout error - retriable
+				// Network/timeout error - retriable. Drop the stale link so the
+				// downloader's next attempt re-validates/refetches it.
+				m.linkService.Invalidate(downloadLink)
 				return copyErr
 			}
 			// Unknown error - don't retry to avoid infinite loops

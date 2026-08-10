@@ -1,6 +1,9 @@
 package torbox
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 type APIResponse[T any] struct {
 	Success bool   `json:"success"`
@@ -73,6 +76,16 @@ type torboxInfo struct {
 type InfoResponse APIResponse[torboxInfo]
 
 type DownloadLinksResponse APIResponse[string]
+
+// RequestDLResponse is the JSON body returned by /api/torrents/requestdl when
+// called with redirect=false. TorBox returns the real, cacheable CDN URL as a
+// plain JSON string in `data` — NOT an object. Earlier code decoded `data` into
+// a struct with a `download_link` field, which failed with an unmarshal error
+// and made the requestdl call appear empty, so every TorBox link fetch 412'd.
+// We keep the raw payload so fetchDownloadLink can accept both the string form
+// (current) and the legacy object form (older API revisions) without a decode
+// failure.
+type RequestDLResponse APIResponse[json.RawMessage]
 
 type TorrentsListResponse APIResponse[[]torboxInfo]
 

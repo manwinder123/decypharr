@@ -283,10 +283,82 @@ func (s *Service) fetchLink(ctx context.Context, entry *storage.Entry, filename 
 	}
 
 	if downloadLink.Empty() {
+		// Placement file ids can go stale when the provider re-adds/merges a
+		// torrent (TorBox reassigns per-file ids; cli_debrid re-adds packs).
+		// requestdl then returns no CDN link even though the file IS
+		// downloadable. This happens to servable entries that got prematurely
+		// flagged Bad (entry.Bad short-circuits below), so we run the refresh
+		// FIRST — before the Bad check — and un-Bad + return when it succeeds.
+		var recovered types.DownloadLink
+		if s.entryRefresher != nil {
+			if refreshed, rerr := s.entryRefresher(entry.InfoHash); rerr == nil && refreshed != nil {
+				if rp := refreshed.GetActiveProvider(); rp != nil {
+					var rpf *storage.ProviderFile
+					rpf = rp.Files[filename]
+					if rpf == nil && file.Size > 0 {
+						for k, sf := range refreshed.Files {
+							if sf.Size == file.Size {
+								if pf := rp.Files[k]; pf != nil && (pf.Id != "" || pf.Link != "") {
+									rpf = pf
+									break
+								}
+							}
+						}
+					}
+					s.logger.Debug().
+						Str("infohash", entry.InfoHash).
+						Str("entry", entry.Name).
+						Str("refreshed", refreshed.Name).
+						Str("filename", filename).
+						Str("rpf_id", func() string { if rpf != nil { return rpf.Id }; return "<none>" }()).
+						Str("placement_id", rp.ID).
+						Bool("entry_bad", entry.Bad).
+						Msg("empty-link refresh attempt")
+					if rpf != nil && (rpf.Id != "" || rpf.Link != "") {
+						retryFile := &types.File{
+							Id:        rpf.Id,
+							Link:      rpf.Link,
+							Path:      rpf.Path,
+							Name:      file.Name,
+							Size:      file.Size,
+							ByteRange: file.ByteRange,
+							Deleted:   file.Deleted,
+						}
+						if dl2, err2 := client.GetDownloadLink(rp.ID, retryFile); err2 == nil && !dl2.Empty() {
+							recovered = dl2
+						} else {
+							s.logger.Info().Err(err2).Str("filename", filename).Str("rpf_id", rpf.Id).Msg("empty-link refresh did not recover link")
+						}
+					}
+				}
+			} else {
+				s.logger.Info().Err(rerr).Str("infohash", entry.InfoHash).Msg("empty-link refresh skipped/failed")
+			}
+		}
+		if !recovered.Empty() {
+			if entry.Bad {
+				entry.Bad = false
+				if s.entrySaver != nil {
+					_ = s.entrySaver(entry)
+				}
+				s.logger.Info().
+					Str("infohash", entry.InfoHash).
+					Str("name", entry.Name).
+					Msg("Cleared Bad flag after empty-link recovery")
+			}
+			s.logger.Info().
+				Str("infohash", entry.InfoHash).
+				Str("name", entry.Name).
+				Str("filename", filename).
+				Msg("Recovered empty link via provider placement refresh")
+			return recovered, nil
+		}
+
 		// Let's try to reinsert the entry
 		if entry.Bad {
 			return emptyDownloadLink, fmt.Errorf("can't repair %s since it's been marked as bad", entry.GetFolder())
 		}
+
 		if s.repairer == nil {
 			// No repairer configured (e.g. this fork's CLI-managed re-insertion) —
 			// mark bad immediately so CLI can handle it, same as handleBadLink's
@@ -517,4 +589,23 @@ func (s *Service) invalidateAndRefetch(ctx context.Context, entry *storage.Entry
 // Clear removes all validation tracking entries
 func (s *Service) Clear() {
 	s.validated.Clear()
+}
+
+// Invalidate drops a download link from the validation map and the
+// account-level link cache without contacting the provider. The next GetLink
+// call for the same file mints + validates a fresh link. Used when an in-flight
+// stream fails (no-progress stall, dead CDN connection) so retries don't burn
+// their budget reusing the same revoked/expired URL.
+func (s *Service) Invalidate(dl types.DownloadLink) {
+	if dl.DownloadLink != "" {
+		s.validated.Delete(dl.DownloadLink)
+	}
+	if dl.Debrid == "" || dl.Token == "" {
+		return
+	}
+	client, err := s.getClient(dl.Debrid)
+	if err != nil {
+		return
+	}
+	_ = client.DeleteLink(dl)
 }

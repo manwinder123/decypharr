@@ -15,6 +15,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/customerror"
 	"github.com/sirrobot01/decypharr/internal/utils"
+	"github.com/sirrobot01/decypharr/pkg/manager"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
@@ -393,17 +394,56 @@ func (s *Server) handleDownloadFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTorrentDownload(w http.ResponseWriter, r *http.Request, entry *storage.Entry, file *storage.File) {
-	// For torrents, get debrid download link and redirect
-	link, err := s.manager.GetDownloadLink(r.Context(), entry, file.Name)
-	if err != nil || link.Empty() {
-		s.logger.Error().Err(err).Str("torrent", entry.Name).Str("file", file.Name).Msg("Failed to get download link")
-		http.Error(w, "Could not fetch download link", http.StatusPreconditionFailed)
-		return
+	// Proxy the file through the manager stream path instead of redirecting
+	// straight to the CDN. The stream path validates the download link (so a
+	// genuinely unservable entry returns a clean 412 rather than a dead 302)
+	// and is bounded by the global CDN-stream semaphore, which keeps parallel
+	// prefetches/transcodes/Plex reads under the debrid account's
+	// concurrent-download slot ceiling and stops the provider 429ing us.
+	start, end := int64(0), file.Size-1
+	if rng := r.Header.Get("Range"); rng != "" && strings.HasPrefix(rng, "bytes=") {
+		spec := strings.TrimPrefix(rng, "bytes=")
+		if parts := strings.SplitN(spec, "-", 2); len(parts) == 2 {
+			if v, err := strconv.ParseInt(parts[0], 10, 64); err == nil {
+				start = v
+			}
+			if parts[1] != "" {
+				if v, err := strconv.ParseInt(parts[1], 10, 64); err == nil {
+					end = v
+				}
+			}
+		}
+		if start < 0 || start > file.Size-1 || end < start {
+			start, end = 0, file.Size-1
+		}
 	}
+	var headersWritten bool
+	err := s.manager.Stream(r.Context(), entry, file.Name, start, end, w,
+		func(meta *manager.StreamMetadata) error {
+			w.Header().Set("Content-Type", utils.GetContentType(file.Name))
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", file.Name))
+			if meta.ContentLength > 0 {
+				w.Header().Set("Content-Length", strconv.FormatInt(meta.ContentLength, 10))
+			}
+			w.Header().Set("Accept-Ranges", "bytes")
+			if meta.StatusCode != 0 {
+				w.WriteHeader(meta.StatusCode)
+			}
+			headersWritten = true
+			return nil
+		}, "api")
 
-	w.Header().Set("X-Accel-Redirect", link.DownloadLink)
-	w.Header().Set("X-Accel-Buffering", "no")
-	http.Redirect(w, r, link.DownloadLink, http.StatusFound)
+	if err != nil {
+		if !headersWritten {
+			s.logger.Error().Err(err).Str("torrent", entry.Name).Str("file", file.Name).Msg("Failed to get download link")
+			http.Error(w, err.Error(), http.StatusPreconditionFailed)
+			return
+		}
+		// Headers already flushed to the client; can only log the mid-stream error.
+		if !customerror.IsSilentError(err) {
+			s.logger.Error().Err(err).Str("torrent", entry.Name).Str("file", file.Name).Msg("Download stream failed after headers sent")
+		}
+	}
 }
 
 func (s *Server) handleRenameEntry(w http.ResponseWriter, r *http.Request) {

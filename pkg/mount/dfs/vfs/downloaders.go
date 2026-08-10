@@ -45,8 +45,10 @@ const (
 	// noProgressTimeout is the max time a stream attempt may run without any
 	// bytes written. Keep this above the NNTP per-segment idle timeout so a
 	// slow/stalled usenet provider can be classified and retried before DFS
-	// cancels the attempt.
-	noProgressTimeout = 90 * time.Second
+	// cancels the attempt. Tuned down from 90s so a live-but-throttled debrid
+	// stream (TorBox/Real-Debrid returning 429 / pausing under load) is detected
+	// and retried ~2x faster instead of blocking a read for a full 90 seconds.
+	noProgressTimeout = 45 * time.Second
 	// noProgressCheckInterval is how often stall detection checks for forward progress.
 	noProgressCheckInterval = 1 * time.Second
 	// maxChunkSizeMultiplier caps adaptive chunk growth at this multiple of baseChunkSize.

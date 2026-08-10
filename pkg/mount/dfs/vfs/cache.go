@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
@@ -471,14 +472,36 @@ func (c *Cache) storeDiskStats(candidates []candidateEntry, removed map[string]s
 // the buffer is seeded with any ranges from previously-persisted metadata
 // so a re-opened item can serve its cached bytes immediately without
 // re-downloading.
+// safeComponent returns a filesystem path component that always fits within
+// NAME_MAX (255 bytes), even for very long torrent/filename strings (long
+// Russian torrent names routinely exceed 255 bytes). Names under the cap are
+// returned unchanged; longer ones are truncated on a UTF-8 rune boundary and
+// given a stable short hash so truncated names stay unique and re-open
+// deterministically.
+func safeComponent(name string) string {
+	const maxBytes = 200 // headroom under the 255-byte ext4 NAME_MAX
+	if len(name) <= maxBytes {
+		return name
+	}
+	b := []byte(name)[:maxBytes]
+	// Don't split a multi-byte UTF-8 rune at the cut.
+	for len(b) > 0 && b[len(b)-1]&0xC0 == 0x80 {
+		b = b[:len(b)-1]
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(name))
+	return string(b) + "-" + fmt.Sprintf("%x", h.Sum64())[:8]
+}
+
 func (c *Cache) newItem(key, entryName, filename string, fileSize int64) (*CacheItem, error) {
-	itemDir := filepath.Join(c.config.CacheDir, entryName)
+	itemDir := filepath.Join(c.config.CacheDir, safeComponent(entryName))
 	if err := os.MkdirAll(itemDir, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create item dir: %w", err)
 	}
 
-	cachePath := filepath.Join(itemDir, filename)
-	metaPath := filepath.Join(itemDir, filename+".json")
+	diskFilename := safeComponent(filename)
+	cachePath := filepath.Join(itemDir, diskFilename)
+	metaPath := filepath.Join(itemDir, diskFilename+".json")
 
 	// Load existing metadata before constructing the buffer so its range
 	// tracker is seeded with anything the prior session persisted.

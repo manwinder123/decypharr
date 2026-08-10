@@ -546,6 +546,15 @@ class ConfigManager {
                                        placeholder="1" value="1">
                                 <span class="text-sm opacity-70">Minimum free slot for this debrid</span>
                             </div>
+                            <div>
+                                <label class="label" for="debrid[${index}].max_concurrent_streams">
+                                    <span class=" font-medium">Max Concurrent Streams</span>
+                                </label>
+                                <input type="number" class="input w-full" 
+                                       name="debrid[${index}].max_concurrent_streams" id="debrid[${index}].max_concurrent_streams" 
+                                       placeholder="0" value="0">
+                                <span class="text-sm opacity-70">Override parallel CDN stream pool size (0 = use plan slots, e.g. TorBox essential=3). Raise it to allow more parallel downloads — applies live.</span>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -1350,6 +1359,13 @@ class ConfigManager {
             debrid.torrents_refresh_interval = torrentsRefreshIntervalInput.value;
             debrid.download_links_refresh_interval = downloadLinksRefreshIntervalInput.value;
             debrid.auto_expire_links_after = autoExpireLinksAfterInput.value;
+
+            // Optional override of the parallel CDN stream pool size (0 = use
+            // the provider's reported plan slots).
+            const maxConcurrentStreamsInput = getField('max_concurrent_streams');
+            if (maxConcurrentStreamsInput) {
+                debrid.max_concurrent_streams = parseInt(maxConcurrentStreamsInput.value, 10) || 0;
+            }
 
             if (debrid.name && debrid.api_key && debrid.provider) {
                 debrids.push(debrid);

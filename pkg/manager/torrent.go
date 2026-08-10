@@ -3,6 +3,8 @@ package manager
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -495,7 +497,23 @@ func (m *Manager) refreshTorrent(infohash string) (*storage.Entry, error) {
 	// GetReader updated torrent info from debrid
 	debridTorrent, err := client.GetTorrent(placement.ID)
 	if err != nil {
-		return nil, err
+		// Stale/incorrect placement ID — re-discover the torrent by infohash.
+		if t2, e2 := m.findTorrentByHash(client, torrent.InfoHash); e2 == nil && t2 != nil {
+			debridTorrent = t2
+		} else {
+			return nil, err
+		}
+	} else if !m.torrentSharesFiles(torrent, debridTorrent) {
+		// The stored placement ID now points at a DIFFERENT torrent (TorBox
+		// reassigns ids after cli_debrid re-adds packs; the corrupt entry's
+		// placement can even resolve to an unrelated torrent). Re-discover by
+		// infohash so we rebuild the entry from the still-correct torrent.
+		t2, e2 := m.findTorrentByHash(client, torrent.InfoHash)
+		if e2 == nil && t2 != nil {
+			debridTorrent = t2
+			m.logger.Info().Str("infohash", torrent.InfoHash).Str("name", torrent.Name).
+				Msg("Re-discovered torrent by infohash after placement-ID mismatch")
+		}
 	}
 
 	entry, err := m.processSyncTorrent(debridTorrent)
@@ -512,6 +530,54 @@ func (m *Manager) refreshTorrent(infohash string) (*storage.Entry, error) {
 		return nil, err
 	}
 	return entry, nil
+}
+
+// findTorrentByHash locates the current provider torrent for an infohash by
+// scanning the provider's torrent list and re-fetching it. Used to recover from
+// stale/corrupt placement IDs (TorBox reassigns ids after re-adds).
+func (m *Manager) findTorrentByHash(client debrid.Client, infohash string) (*types.Torrent, error) {
+	if infohash == "" {
+		return nil, fmt.Errorf("empty infohash")
+	}
+	torrents, err := client.GetTorrents()
+	if err != nil {
+		return nil, err
+	}
+	for _, t := range torrents {
+		if t != nil && strings.EqualFold(t.InfoHash, infohash) {
+			return client.GetTorrent(t.Id)
+		}
+	}
+	return nil, fmt.Errorf("no torrent found for infohash %s", infohash[:min(12, len(infohash))])
+}
+
+// torrentSharesFiles reports whether a provider torrent and a stored entry
+// appear to describe the same media (shared file size and/or basename). Used to
+// detect a placement ID that now resolves to an unrelated torrent. Returns true
+// when either side is empty (nothing to compare) so we don't force rediscovery.
+func (m *Manager) torrentSharesFiles(entry *storage.Entry, t *types.Torrent) bool {
+	if t == nil || entry == nil || len(t.Files) == 0 || len(entry.Files) == 0 {
+		return true
+	}
+	tSizes := make(map[int64]bool, len(t.Files))
+	tNames := make(map[string]bool, len(t.Files))
+	for _, f := range t.Files {
+		if f.Size > 0 {
+			tSizes[f.Size] = true
+		}
+		if f.Name != "" {
+			tNames[filepath.Base(f.Name)] = true
+		}
+	}
+	for name, f := range entry.Files {
+		if f != nil && tSizes[f.Size] {
+			return true
+		}
+		if tNames[name] || tNames[filepath.Base(name)] {
+			return true
+		}
+	}
+	return false
 }
 
 // refreshDebridDownloadLinks refreshes download links for a specific debrid service

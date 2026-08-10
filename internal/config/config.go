@@ -766,6 +766,13 @@ func clearHotFields(c *Config) {
 	// so changes apply on the next cleanup cycle without a restart.
 	c.QueueCleanup = QueueCleanup{}
 
+	// Per-debrid CDN stream concurrency override is read live by
+	// streamPoolFor on every call, so changing it alone must not force a
+	// restart. (All other Debrid fields stay cold.)
+	for i := range c.Debrids {
+		c.Debrids[i].MaxConcurrentStreams = 0
+	}
+
 	// Deprecated, migrated into Manager fields above.
 	c.QBitTorrent = QBitTorrent{}
 
