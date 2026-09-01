@@ -1092,54 +1092,80 @@ func (p *NZBParser) detectFileTypeByContent(ctx context.Context, file nzbparser.
 		}
 	}
 
-	return p.detectFileTypeFromContent(data.Snippet), data.Name, nil
+	fileType, inferredExt := p.detectFileTypeAndExtensionFromContent(data.Snippet)
+	if fileType == storage.NZBFileTypeMedia && inferredExt != "" {
+		// Obfuscated post whose yEnc header name (or subject-derived name)
+		// carries no recognizable extension: build a streamable filename
+		// from the content signature. Guard on the base name so a name
+		// that already has a known extension never becomes "name.mkv.mkv".
+		base := data.Name
+		if base == "" {
+			base = file.Filename
+		}
+		if p.detectFileType(base) == storage.NZBFileTypeUnknown {
+			return fileType, base + inferredExt, nil
+		}
+	}
+	return fileType, data.Name, nil
 }
 
-func (p *NZBParser) detectFileTypeFromContent(data []byte) storage.NZBFileType {
+// detectFileTypeAndExtensionFromContent classifies an extensionless post from
+// its leading bytes and returns a canonical extension when the signature is
+// specific enough to build a streamable filename. Ported from upstream
+// e7ca363 (sirrobot01 beta) for obfuscated-media handling.
+func (p *NZBParser) detectFileTypeAndExtensionFromContent(data []byte) (storage.NZBFileType, string) {
 	if len(data) == 0 {
-		return storage.NZBFileTypeUnknown
+		return storage.NZBFileTypeUnknown, ""
+	}
+
+	// Parity data is not playable content, including when the filename is
+	// obfuscated, so never surface it as a streamable file.
+	if len(data) >= 8 && bytes.Equal(data[:8], []byte{'P', 'A', 'R', 2, 0, 'P', 'K', 'T'}) {
+		return storage.NZBFileTypeIgnore, ""
 	}
 
 	// Check for RAR signatures (both RAR 4.x and 5.x)
 	if len(data) >= 7 {
 		// RAR 4.x signature
 		if bytes.Equal(data[:7], []byte("Rar!\x1A\x07\x00")) {
-			return storage.NZBFileTypeRar
+			return storage.NZBFileTypeRar, ""
 		}
 	}
 	if len(data) >= 8 {
 		// RAR 5.x signature
 		if bytes.Equal(data[:8], []byte("Rar!\x1A\x07\x01\x00")) {
-			return storage.NZBFileTypeRar
+			return storage.NZBFileTypeRar, ""
 		}
 	}
 
 	// Check for ZIP signature
 	if len(data) >= 4 && bytes.Equal(data[:4], []byte{0x50, 0x4B, 0x03, 0x04}) {
-		return storage.NZBFileTypeZip
+		return storage.NZBFileTypeZip, ""
 	}
 
 	// Check for 7z signature
 	if len(data) >= 6 && bytes.Equal(data[:6], []byte{0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C}) {
-		return storage.NZBFileTypeSevenZip
+		return storage.NZBFileTypeSevenZip, ""
 	}
 
-	// Check for common media file signatures
+	// Check for common media file signatures. Only signatures with one
+	// canonical container extension infer one (MPEG PS/TS stay bare —
+	// their extension is ambiguous: .mpg/.ts/.m2ts).
 	if len(data) >= 4 {
 		// Matroska (MKV/WebM)
 		if bytes.Equal(data[:4], []byte{0x1A, 0x45, 0xDF, 0xA3}) {
-			return storage.NZBFileTypeMedia
+			return storage.NZBFileTypeMedia, ".mkv"
 		}
 
 		// MP4/MOV (check for 'ftyp' at offset 4)
 		if len(data) >= 8 && bytes.Equal(data[4:8], []byte("ftyp")) {
-			return storage.NZBFileTypeMedia
+			return storage.NZBFileTypeMedia, ".mp4"
 		}
 
 		// AVI
 		if len(data) >= 12 && bytes.Equal(data[:4], []byte("RIFF")) &&
 			bytes.Equal(data[8:12], []byte("AVI ")) {
-			return storage.NZBFileTypeMedia
+			return storage.NZBFileTypeMedia, ".avi"
 		}
 	}
 
@@ -1147,12 +1173,12 @@ func (p *NZBParser) detectFileTypeFromContent(data []byte) storage.NZBFileType {
 	if len(data) >= 4 {
 		// MPEG-1/2 Program Stream
 		if bytes.Equal(data[:4], []byte{0x00, 0x00, 0x01, 0xBA}) {
-			return storage.NZBFileTypeMedia
+			return storage.NZBFileTypeMedia, ""
 		}
 
 		// MPEG-1/2 Video Stream
 		if bytes.Equal(data[:4], []byte{0x00, 0x00, 0x01, 0xB3}) {
-			return storage.NZBFileTypeMedia
+			return storage.NZBFileTypeMedia, ""
 		}
 	}
 
@@ -1161,9 +1187,17 @@ func (p *NZBParser) detectFileTypeFromContent(data []byte) storage.NZBFileType {
 		// Additional validation: TS packets are 188 bytes, so the next
 		// sync byte sits at index 188 (requires at least 189 bytes).
 		if len(data) > 188 && data[188] == 0x47 {
-			return storage.NZBFileTypeMedia
+			return storage.NZBFileTypeMedia, ""
 		}
 	}
 
-	return storage.NZBFileTypeUnknown
+	return storage.NZBFileTypeUnknown, ""
 }
+
+// detectFileTypeFromContent is the type-only view used by existing callers
+// and tests.
+func (p *NZBParser) detectFileTypeFromContent(data []byte) storage.NZBFileType {
+	fileType, _ := p.detectFileTypeAndExtensionFromContent(data)
+	return fileType
+}
+
