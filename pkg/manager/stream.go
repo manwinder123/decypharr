@@ -442,8 +442,10 @@ func (m *Manager) streamUsenet(ctx context.Context, entry *storage.Entry, filena
 		}
 	}
 
-	// Stream NZB content directly into writer
-	return m.usenet.Stream(ctx, entry.InfoHash, filename, start, end, writer)
+	// Stream NZB content directly into writer. Pass the entry's download
+	// folder so the usenet client can serve already-downloaded files from
+	// disk instead of re-streaming segments over NNTP.
+	return m.usenet.Stream(ctx, entry.InfoHash, filename, entry.DownloadPath(), start, end, writer)
 }
 
 func normalizeStreamRange(size, start, end int64) (int64, int64, error) {

@@ -1,6 +1,7 @@
 package usenet
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -25,6 +26,10 @@ const (
 	// files have been upgraded to the v2 codec, so migration runs at most once.
 	metaMigrationMarker = ".codec-v2.done"
 )
+
+// ErrNZBNotFound distinguishes a genuinely missing metadata file from a
+// transient read/decode error. Queue cleanup must only purge on this sentinel.
+var ErrNZBNotFound = errors.New("nzb not found")
 
 const (
 	NZBStatusPending     = "pending"
@@ -149,7 +154,7 @@ func (s *NZBStorage) GetNZB(id string) (*storage.NZB, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("nzb not found: %s", id)
+			return nil, fmt.Errorf("%w: %s", ErrNZBNotFound, id)
 		}
 		return nil, fmt.Errorf("failed to read NZB meta file: %w", err)
 	}
@@ -168,7 +173,7 @@ func (s *NZBStorage) GetNZBHeader(id string) (*storage.NZB, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("nzb not found: %s", id)
+			return nil, fmt.Errorf("%w: %s", ErrNZBNotFound, id)
 		}
 		return nil, fmt.Errorf("failed to read NZB meta file: %w", err)
 	}

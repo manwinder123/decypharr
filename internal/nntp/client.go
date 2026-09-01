@@ -741,7 +741,6 @@ func parseSockBuf(s string) int {
 	return int(n)
 }
 
-
 // tuneTCP applies TCP_NODELAY and (re)applies the configured socket buffers
 // on the established connection. The pre-connect Control hook does the work
 // that matters for window scaling; this reinforces the sizes post-dial and
@@ -812,6 +811,7 @@ func (c *Client) createConnection(ctx context.Context, provider config.UsenetPro
 		text:     textproto.NewReader(reader),
 		writer:   writer,
 		address:  provider.Host,
+		backbone: provider.Backbone,
 		port:     provider.Port,
 		username: provider.Username,
 		password: provider.Password,

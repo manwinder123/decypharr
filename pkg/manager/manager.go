@@ -108,7 +108,6 @@ type Manager struct {
 
 	// Notifications service
 	Notifications *notifications.Service
-
 }
 
 // New creates a new Manager instance
@@ -187,7 +186,6 @@ func New() *Manager {
 		debridSpeedTestResults: xsync.NewMap[string, debridTypes.SpeedTestResult](),
 		activeStreams:          xsync.NewMap[string, *ActiveStream](),
 		processingEntries:      xsync.NewMap[string, struct{}](),
-
 	}
 
 	instance.init()
@@ -318,6 +316,15 @@ func (m *Manager) initJobQueue() {
 
 func (m *Manager) processJob(ctx context.Context, job *Job) {
 	if job == nil {
+		return
+	}
+	// A persisted NZB can have Status=downloaded while its local post-action
+	// was interrupted before the queue row reached pausedUP/complete. Such a
+	// job must re-enter the downloader; the generic no-payload restore job
+	// below is intentionally wait-only for provider-backed torrents and would
+	// otherwise consume a worker forever.
+	if job.Entry != nil && job.Entry.IsNZB() && job.ResumeExisting {
+		m.processAction(job.Entry)
 		return
 	}
 	if job.Entry != nil && job.Request == nil && job.DebridTorrent == nil && job.NZBMeta == nil && !job.ResumeExisting {

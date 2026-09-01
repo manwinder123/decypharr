@@ -145,7 +145,7 @@ func ErrorCodeToLinkError(code string) *Error {
 		return NewPermanentError(Err404, code)
 	case "429":
 		return NewRetryableError(Err429, code)
-	case "503":
+	case "503", "read_pxy_timeout":
 		return NewRetryableError(Err503, code)
 	// 500/502/504 are transient upstream failures, not evidence the file is
 	// gone. Categorizing them Retryable (not Permanent) matters for two

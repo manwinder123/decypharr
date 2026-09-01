@@ -10,6 +10,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/config"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet"
 	"github.com/sirrobot01/decypharr/pkg/usenet/parser"
 )
 
@@ -58,9 +59,13 @@ func (m *Manager) AddNewNZB(ctx context.Context, req *ImportRequest) (string, er
 		Tags:             []string{},
 	}
 
-	entry.ContentPath = entry.DownloadPath()
-	entry.ActiveProvider = "usenet"
-	_ = entry.AddUsenetProvider(meta)
+	// NZB entries default to a real download to the local download folder
+	// (the generic symlink/strm actions assume a working symlink-capable
+	// filesystem, which union mounts often lack). The mount then serves the
+	// downloaded file from disk instead of streaming over NNTP.
+	if entry.Action == "" {
+		entry.Action = config.DownloadActionDownload
+	}
 	if err := m.queue.Add(entry); err != nil {
 		return "", fmt.Errorf("failed to add nzb to queue: %w", err)
 	}
@@ -86,6 +91,16 @@ func (m *Manager) processNZBJob(ctx context.Context, job *Job) error {
 	if _, err := m.queue.GetTorrent(job.Entry.InfoHash); err != nil {
 		return nil
 	}
+	// The scheduler can discover the same completed NZB while an API-submitted
+	// job is still parsing it. Share one ownership fence across both paths;
+	// IsDownloading is set later by processNZB for the post-parse phase, so the
+	// map claim also covers the parse-to-publish window.
+	if m.processingEntries != nil {
+		if _, loaded := m.processingEntries.LoadOrStore(job.Entry.InfoHash, struct{}{}); loaded {
+			return nil
+		}
+		defer m.processingEntries.Delete(job.Entry.InfoHash)
+	}
 	if job.NZBMeta == nil {
 		if job.Request == nil {
 			m.waitForDownloadCompletion(ctx, job.Entry)
@@ -97,9 +112,15 @@ func (m *Manager) processNZBJob(ctx context.Context, job *Job) error {
 		job.Request.Status = "started"
 	}
 	return m.processNewNzb(ctx, job.Entry, job.NZBMeta, job.NZBGroups)
-}
 
+}
 func (m *Manager) processNZB(ctx context.Context, entry *storage.Entry, metadata *storage.NZB) error {
+	// Parsing completes before the local download/post-action. Mark the entry
+	// in-flight before publishing it so processQueuedEntries cannot observe the
+	// completed metadata and launch a second processAction while the first one
+	// is still downloading. The old ordering caused duplicate NZB downloads and
+	// consumed workers until the watchdog interpreted the queue as wedged.
+	entry.IsDownloading = true
 	// Add files using logical streamable files
 	for _, file := range metadata.Files {
 		tFile := &storage.File{
@@ -127,6 +148,7 @@ func (m *Manager) processNZB(ctx context.Context, entry *storage.Entry, metadata
 
 	go m.processAction(entry)
 	return nil
+
 }
 
 // processNewNzb processes a new NZB entry after it has been added to the usenet client
@@ -254,14 +276,22 @@ func (m *Manager) purgeOrphanNZBQueueEntries() {
 
 	purged := 0
 	for _, entry := range entries {
-		if _, err := m.usenet.GetNZB(entry.InfoHash); err != nil {
-			// Meta file missing — this job is unknown to the current instance.
-			if err := m.queue.DeleteEntryOnly(entry.InfoHash); err != nil {
-				m.logger.Warn().Err(err).Str("name", entry.Name).Str("id", entry.InfoHash).Msg("Failed to purge orphan NZB queue entry")
-			} else {
-				m.logger.Info().Str("name", entry.Name).Str("id", entry.InfoHash).Msg("Purged orphan NZB queue entry (meta file missing)")
-				purged++
-			}
+		_, err := m.usenet.GetNZB(entry.InfoHash)
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, usenet.ErrNZBNotFound) {
+			// A permission, I/O, or decode failure is not proof that the
+			// queue row is orphaned. Leave it for a later retry.
+			m.logger.Warn().Err(err).Str("name", entry.Name).Str("id", entry.InfoHash).
+				Msg("NZB metadata read failed; leaving queue entry alone")
+			continue
+		}
+		if err := m.queue.DeleteEntryOnly(entry.InfoHash); err != nil {
+			m.logger.Warn().Err(err).Str("name", entry.Name).Str("id", entry.InfoHash).Msg("Failed to purge orphan NZB queue entry")
+		} else {
+			m.logger.Info().Str("name", entry.Name).Str("id", entry.InfoHash).Msg("Purged orphan NZB queue entry (meta file missing)")
+			purged++
 		}
 	}
 

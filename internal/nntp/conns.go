@@ -211,6 +211,7 @@ func (c *Connection) readResponseCodeWithDeadline(timeout time.Duration) (int, [
 // Connection represents an NNTP connection
 type Connection struct {
 	username, password, address string
+	backbone                    string
 	port                        int
 	conn                        net.Conn
 	text                        *textproto.Reader
@@ -238,6 +239,25 @@ func (c *Connection) Close() error {
 
 func (c *Connection) IsClosed() bool {
 	return c.closed.Load()
+}
+
+// ProviderHost returns the configured NNTP host for this connection. It is
+// intentionally limited to the host, not credentials or connection details,
+// so callers can attribute article failures without exposing secrets.
+func (c *Connection) ProviderHost() string {
+	if c == nil {
+		return ""
+	}
+	return c.address
+}
+
+// ProviderBackbone returns the configured shared-backbone identifier. An
+// empty value means the provider host is the only available identity.
+func (c *Connection) ProviderBackbone() string {
+	if c == nil {
+		return ""
+	}
+	return c.backbone
 }
 
 func (c *Connection) authenticate() error {
@@ -592,13 +612,19 @@ func (c *Connection) GetDecodedBodyWithMetadata(messageID string) ([]byte, *Yenc
 	// Pre-allocate output buffer for decoded data (~700KB typical)
 	output := bytes.NewBuffer(make([]byte, 0, 750*1024))
 	_, err = c.copyBodyWithIdleDeadline(output, dec, timeouts.StreamBodyTimeout)
+	metadata := metadataFromDecoder(dec, nil)
 
 	if err != nil {
-		return nil, nil, classifyTransferError("streaming yenc decode failed", err)
+		// A decoder error may leave unread article bytes on the socket.
+		// Never return that connection to the reusable pool.
+		_ = c.Close()
+		// Keep the partial bytes and parsed yEnc header for the caller's
+		// diagnostic record. Callers must still discard the bytes on error.
+		return output.Bytes(), metadata, classifyTransferError("streaming yenc decode failed", err)
 	}
 	decoded := output.Bytes()
 
-	return decoded, metadataFromDecoder(dec, nil), nil
+	return decoded, metadata, nil
 }
 
 func (c *Connection) StreamBody(messageID string, w io.Writer) (int64, error) {
@@ -621,6 +647,9 @@ func (c *Connection) StreamBody(messageID string, w io.Writer) (int64, error) {
 	defer nntpyenc.ReleaseDecoder(dec)
 	n, err := c.copyBodyWithIdleDeadline(w, dec, timeouts.StreamBodyTimeout)
 	if err != nil {
+		// The response stream may be only partially consumed; discard this
+		// connection instead of allowing the next command to desynchronize.
+		_ = c.Close()
 		return n, classifyTransferError("streaming yenc decode failed", err)
 	}
 	return n, nil

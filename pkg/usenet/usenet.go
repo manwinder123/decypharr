@@ -219,6 +219,14 @@ type Usenet struct {
 	prefetchSize             int64       // Streaming prefetch size in bytes
 	failedFiles              *xsync.Map[string, error]
 
+	// Failure evidence is written only on error paths; serialize append and
+	// bound the ledger so diagnostics cannot become a second queue.
+	failureLogPath string
+	failureLogMu   sync.Mutex
+	// File-level deletion updates are read/modify/write operations. Serialize
+	// them so concurrent failed segments cannot overwrite each other's marks.
+	nzbMutationMu sync.Mutex
+
 	fs *xsync.Map[string, *fsEntry]
 }
 
@@ -288,6 +296,7 @@ func New() (*Usenet, error) {
 		nntp:                     client,
 		logger:                   _logger,
 		metadataDir:              metadataDir,
+		failureLogPath:           filepath.Join(metadataDir, "article_failures.jsonl"),
 		maxConnections:           maxConns,
 		processingMaxConnections: processingMaxConns,
 		prefetchSize:             prefetchSize,
@@ -313,10 +322,20 @@ func (u *Usenet) initStreamsDir(streamsDir string) {
 	}
 }
 
-func (u *Usenet) createEntry(file *storage.NZBFile) (*fsEntry, error) {
+func (u *Usenet) createEntry(file *storage.NZBFile, localDir string) (*fsEntry, error) {
 	volumes := GetFileVolumes(file)
 	if len(volumes) == 0 {
 		return nil, fmt.Errorf("no volumes available for file %s", file.Name)
+	}
+
+	// If this file has already been downloaded to the local download folder,
+	// serve it from disk instead of streaming segments over NNTP. The size
+	// check guards against serving a partial/aborted download.
+	if localDir != "" && len(volumes) > 0 {
+		p := filepath.Join(localDir, file.Name)
+		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() && fi.Size() == file.Size {
+			volumes[0].LocalPath = p
+		}
 	}
 
 	fsCtx := context.Background()
@@ -333,7 +352,7 @@ func (u *Usenet) createEntry(file *storage.NZBFile) (*fsEntry, error) {
 }
 
 // getOrCreateEntry returns the fsEntry and its cache key to avoid redundant key computation.
-func (u *Usenet) getOrCreateEntry(ctx context.Context, nzoID, filename string) (*fsEntry, string, error) {
+func (u *Usenet) getOrCreateEntry(ctx context.Context, nzoID, filename, localDir string) (*fsEntry, string, error) {
 	key := fsKey(nzoID, filename)
 
 	// Fast path: entry already exists and isn't being torn down. acquire() (a
@@ -356,7 +375,7 @@ func (u *Usenet) getOrCreateEntry(ctx context.Context, nzoID, filename string) (
 		return nil, key, err
 	}
 
-	newEntry, err := u.createEntry(file)
+	newEntry, err := u.createEntry(file, localDir)
 	if err != nil {
 		return nil, key, err
 	}
@@ -703,6 +722,8 @@ func (u *Usenet) getFile(nzoID, filename string) (*storage.NZBFile, error) {
 // markNZBFileDeleted marks a specific NZB file as permanently deleted in storage so the
 // article-not-found status survives process restarts.
 func (u *Usenet) markNZBFileDeleted(nzoID, filename string) {
+	u.nzbMutationMu.Lock()
+	defer u.nzbMutationMu.Unlock()
 	nzb, err := u.nzbStorage.GetNZB(nzoID)
 	if err != nil {
 		u.logger.Warn().Err(err).Str("nzo_id", nzoID).Str("file", filename).Msg("Failed to load NZB to mark file as deleted")
@@ -784,7 +805,7 @@ func (u *Usenet) preStreamChecks(file *storage.NZBFile) error {
 }
 
 // Stream streams a file using the new streaming system with caching and worker limiting
-func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end int64, writer io.Writer) error {
+func (u *Usenet) Stream(ctx context.Context, nzoID, filename, localDir string, start, end int64, writer io.Writer) error {
 	if start < 0 {
 		start = 0
 	}
@@ -794,7 +815,7 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 
 	// Use getOrCreateEntry to get both entry and key in one call,
 	// avoiding redundant key computation in releaseFS.
-	ufsEntry, key, err := u.getOrCreateEntry(ctx, nzoID, filename)
+	ufsEntry, key, err := u.getOrCreateEntry(ctx, nzoID, filename, localDir)
 	if err != nil {
 		return fmt.Errorf("failed to get or create file system: %w", err)
 	}
@@ -954,7 +975,7 @@ func (u *Usenet) Touch(ctx context.Context, nzoID, filename string) error {
 // Uses the shared entry/reader so the cache is available for Stream calls.
 func (u *Usenet) PreCache(ctx context.Context, nzoID, filename string) error {
 	// Use shared entry (same as Stream)
-	entry, key, err := u.getOrCreateEntry(ctx, nzoID, filename)
+	entry, key, err := u.getOrCreateEntry(ctx, nzoID, filename, "")
 	if err != nil {
 		return fmt.Errorf("failed to get or create entry: %w", err)
 	}

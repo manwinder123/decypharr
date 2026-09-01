@@ -20,8 +20,16 @@ func (m *Manager) restoreActiveDownloadJobs() {
 		return entries[i].AddedOn.Before(entries[j].AddedOn)
 	})
 
-	// Existing active downloads reserve slots before queued imports are resumed.
+	// NZB entries are owned by the local worker pool. Torrent entries can use
+	// a lightweight wait job while the regular queue processor polls the
+	// provider, but an NZB wait job has no external actor that can advance it.
+	// In particular, a completed-but-not-finalized NZB used to occupy a worker
+	// forever via processJob's wait path, starving every genuinely active NZB
+	// after a restart.
 	for _, entry := range entries {
+		if entry.IsNZB() {
+			continue
+		}
 		if entry.Status == debridTypes.TorrentStatusQueued || m.nzbNeedsReprocessing(entry) {
 			continue
 		}
@@ -32,21 +40,71 @@ func (m *Manager) restoreActiveDownloadJobs() {
 		})
 	}
 
+	// Rebuild interrupted NZB parsing jobs, and resume NZBs whose post-parse
+	// action was interrupted after processAction marked the queue status as
+	// downloaded. The latter must not go through the wait-only job above.
 	for _, entry := range entries {
-		if entry.Status != debridTypes.TorrentStatusQueued && !m.nzbNeedsReprocessing(entry) {
+		if entry == nil {
 			continue
 		}
-		job, err := m.rebuildQueuedJob(entry)
+
+		var (
+			job *Job
+			err error
+		)
+		if entry.IsNZB() {
+			switch {
+			case m.nzbNeedsReprocessing(entry):
+				job, err = m.rebuildQueuedNZBJob(entry)
+			case !entry.IsComplete &&
+				(entry.Status == debridTypes.TorrentStatusDownloaded || entry.Status == debridTypes.TorrentStatusDownloading) &&
+				len(entry.Files) > 0:
+				// processAction may have persisted the entry before its local
+				// download completed. Re-run the action using the persisted file
+				// list; this is resumable at the job level and, unlike waiting,
+				// makes forward progress.
+				job = &Job{
+					ID:             entry.InfoHash,
+					Type:           JobTypeNZB,
+					Entry:          entry,
+					ResumeExisting: true,
+				}
+			case !entry.IsComplete && entry.Status == debridTypes.TorrentStatusDownloading:
+				// A metadata/header race can leave an active NZB with no files
+				// in the queue entry. Reparse the retained source if possible;
+				// a real error is preferable to an immortal 0% row.
+				job, err = m.rebuildQueuedNZBJob(entry)
+			default:
+				continue
+			}
+		} else {
+			if entry.Status != debridTypes.TorrentStatusQueued && !m.nzbNeedsReprocessing(entry) {
+				continue
+			}
+			job, err = m.rebuildQueuedJob(entry)
+		}
+
 		if err != nil {
+			entry.IsDownloading = false
 			entry.MarkAsError(err)
 			_ = m.queue.Update(entry)
 			continue
 		}
-		if job.DebridTorrent == nil && job.NZBMeta == nil {
+		if job == nil {
+			continue
+		}
+
+		// Fence the NZB from processQueuedEntries while its restore job is
+		// queued. This flag is cleared by the normal completion/error paths.
+		if entry.IsNZB() {
+			entry.IsDownloading = true
+		}
+		if job.DebridTorrent == nil && job.NZBMeta == nil && !job.ResumeExisting {
 			entry.Status = debridTypes.TorrentStatusQueued
 		}
 		_ = m.queue.Update(entry)
 		if err := m.SubmitJob(job); err != nil {
+			entry.IsDownloading = false
 			entry.MarkAsError(err)
 			_ = m.queue.Update(entry)
 		}
