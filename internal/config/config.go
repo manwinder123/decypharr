@@ -288,8 +288,35 @@ type Config struct {
 	// Default: true
 	PreferASCIIName *bool `json:"prefer_ascii_name,omitempty"`
 
+	// Bridge enables cross-debrid webseed bridging for RD infringing files.
+	// When RD rejects a torrent with 451 infringing_file, the bridge can rehost
+	// it from TorBox/AllDebrid via a webseed torrent (local or via DMM's public
+	// debrid-uploader). See pkg/bridge for details. Disabled by default.
+	Bridge BridgeConfig `json:"bridge,omitzero"`
+
 	// QueueCleanup is the global arr queue-cleanup policy (see CleanupQueue).
 	QueueCleanup QueueCleanup `json:"queue_cleanup"`
+}
+
+// BridgeConfig controls the TorBox/AllDebrid -> Real-Debrid webseed bridge.
+type BridgeConfig struct {
+	Enabled bool `json:"enabled,omitempty"`
+	// UseDMM toggles using Debrid Media Manager's public debrid-uploader API
+	// (https://debridmediamanager.com/api/debrid-uploader/jobs) as the webseed
+	// host. When true, local WebseedPublicURL is ignored and DMM's servers
+	// farm the bandwidth. Requires the user's RD+TB/AD keys.
+	UseDMM bool `json:"use_dmm,omitempty"`
+	// DMMBaseURL overrides the DMM API base (default https://debridmediamanager.com)
+	DMMBaseURL string `json:"dmm_base_url,omitempty"`
+	// WebseedPublicURL is the public base URL for the local webseed endpoint,
+	// e.g. "https://mydec.example.com". Decypharr serves /webseed/{id}/{path}
+	// and builds torrents with url-list pointing there. Must be reachable by
+	// Real-Debrid's fetchers. Only used when UseDMM=false.
+	WebseedPublicURL string `json:"webseed_public_url,omitempty"`
+	// AutoBridgeRDInfringing when true automatically bridges RD 451 failures
+	// via the configured backend (DMM or local). When false, bridging is
+	// manual via POST /api/bridge/jobs.
+	AutoBridgeRDInfringing bool `json:"auto_bridge_rd_infringing,omitempty"`
 }
 
 func (c *Config) JsonFile() string {

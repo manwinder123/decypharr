@@ -68,6 +68,10 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Delete("/repair/health/{name}", s.handleDeleteEntryHealth)
 			r.Post("/repair/health/{name}/check", s.handleRecheckEntry)
 
+			// Bridge: TorBox/AllDebrid -> Real-Debrid webseed rehosting
+			r.Post("/bridge/jobs", s.handleBridgeCreate)
+			r.Get("/bridge/jobs/{id}", s.handleBridgeStatus)
+
 			// CLI sync endpoint — returns entries changed since a given Unix timestamp
 			r.Get("/sync/changes", s.handleSyncChanges)
 
