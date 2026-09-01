@@ -43,7 +43,7 @@ type Magnets []magnetInfo
 type TorrentInfoResponse struct {
 	Status string `json:"status"`
 	Data   struct {
-		Magnets magnetInfo `json:"magnets"`
+		Magnets Magnets `json:"magnets"`
 	} `json:"data"`
 	Error *errorResponse `json:"error"`
 }
