@@ -21,9 +21,9 @@ Usage:
   python3 bridge_one.py --hash a1b2c3... --imdb tt1234567 --dry-run
   python3 bridge_one.py a1b2c3... --poll-timeout 600
 
-Keys:
-  By default reads your RD/TB/AD keys from quickstack/config/decypharr/config.json (the same file
-  decypharr uses). Override with --rd-key / --tb-key / --ad-key if you want.
+Keys (in priority order):
+  --rd-key/--tb-key/--ad-key flags, DECYPHARR_CONFIG env path, --config path,
+  ./config/decypharr/config.json, ~/.config/decypharr/config.json.
 
 Example for your current 119:
   python3 bridge_one.py --dry-run 4a3b...  # see what would be sent
@@ -47,6 +47,7 @@ existing requeue_rd_infringing.py + TorBox fallback will handle those 119 withou
 """
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -58,10 +59,16 @@ except ImportError:
     sys.exit(1)
 
 DEFAULT_DMM = "https://debridmediamanager.com"
-CONFIG_CANDIDATES = [
-    Path("/home/mdoodle/quickstack/config/decypharr/config.json"),
-    Path("/home/mdoodle/quickstack/config/decypharr/config.json"),  # same, for clarity
-]
+def _default_config_candidates():
+    """Env-first config search (no machine-specific paths in repo)."""
+    cands = []
+    env = os.environ.get("DECYPHARR_CONFIG", "").strip()
+    if env:
+        cands.append(Path(env))
+    cands.append(Path("config/decypharr/config.json"))  # repo-relative CWD
+    cands.append(Path.home() / ".config/decypharr/config.json")
+    return cands
+CONFIG_CANDIDATES = _default_config_candidates()
 
 def load_keys_from_config(path: Path):
     """Read RD/TB/AD keys from decypharr config.json"""
